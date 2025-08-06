@@ -1,0 +1,69 @@
+# Document RAG System - Production Requirements
+# Updated with latest stable versions as of December 2024
+
+# Core LangChain Framework (Latest v0.3.x)
+langchain
+langchain-core
+langchain-community
+langchain-openai
+langchain-qdrant
+
+# Vector Database
+qdrant-client
+
+# OpenAI Integration
+openai
+
+# Document Processing
+python-docx
+python-pptx
+openpyxl
+pandas
+pdfplumber
+PyMuPDF
+beautifulsoup4
+mammoth
+chardet
+docx2txt
+tools
+
+# Google Drive Integration
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+
+# Web Framework & API
+fastapi
+uvicorn[standard]
+pydantic
+
+# Environment & Configuration
+python-dotenv
+
+# Utilities
+requests
+
+# Optional: Advanced Search
+rank-bm25
+
+# Optional: Enhanced Reranking
+cohere
+
+# Optional: OCR Support
+easyocr
+
+# OpenTelemetry Instrumentation
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-requests
+opentelemetry-instrumentation-sqlite3
+opentelemetry-instrumentation-logging
+opentelemetry-instrumentation-openai-v2
+opentelemetry-exporter-otlp-proto-grpc
+opentelemetry-exporter-otlp-proto-http
+#opentelemetry-exporter-console
+opentelemetry-propagator-b3
+opentelemetry-propagator-jaeger
+opentelemetry-propagator-aws-xray

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document RAG Chat Interface</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <!-- Add favicon to prevent 404 errors -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔍</text></svg>">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔍 Document RAG Chat Interface</h1>
+            <p>Chat with your documents using AI-powered search and conversation context</p>
+        </header>
+
+        <main class="chat-container">
+            <!-- Conversation History Area -->
+            <div id="conversationHistory" class="conversation-history">
+                <!-- Welcome message -->
+                <div class="message assistant-message">
+                    <div class="message-content">
+                        <p>👋 Hello! I'm your AI assistant. I can help you find information in your documents and answer questions. Just ask me anything!</p>
+                        <p><strong>Features:</strong></p>
+                        <ul>
+                            <li>🔍 Search through your documents</li>
+                            <li>🤖 Intelligent source selection</li>
+                            <li>💬 Maintain conversation context</li>
+                            <li>📚 Provide source citations</li>
+                            <li>🌐 Multi-language support</li>
+                        </ul>
+                    </div>
+                    <div class="message-timestamp">Just now</div>
+                </div>
+            </div>
+
+            <!-- Input Area -->
+            <div class="input-section">
+                <div class="input-container">
+                    <div class="input-group">
+                        <textarea 
+                            id="queryInput" 
+                            placeholder="Ask me anything about your documents..." 
+                            rows="1"
+                            maxlength="2000"
+                        ></textarea>
+                        <button id="submitBtn" disabled>
+                            <span id="submitText">Send</span>
+                            <span id="loadingSpinner" class="spinner" style="display: none;">⏳</span>
+                        </button>
+                    </div>
+                    
+                    <div class="input-options">
+                        <div class="options-left">
+                            <label class="option-item">
+                                <input type="checkbox" id="includeContext" checked>
+                                <span>Include context</span>
+                            </label>
+                            <span class="char-count" id="charCount">0/2000</span>
+                        </div>
+                        
+                        <div class="options-right">
+                            <label class="option-item">
+                                <span>Citations:</span>
+                                <select id="citationFormat">
+                                    <option value="apa">APA</option>
+                                    <option value="mla">MLA</option>
+                                    <option value="chicago">Chicago</option>
+                                </select>
+                            </label>
+                            <span class="option-item" style="color: #666; font-size: 0.9rem;">
+                                🤖 Intelligent source selection
+                            </span>
+                            <button id="clearChatBtn" class="secondary-btn">
+                                Clear Chat
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <footer>
+            <p>Enhanced with conversation context, hybrid search, and AI-powered responses</p>
+        </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html> 
