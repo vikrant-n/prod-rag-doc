@@ -26,60 +26,41 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Initialize OpenTelemetry early
-import sys
-sys.path.append('..')  # Add parent directory to path for otel_config
-from otel_config import initialize_opentelemetry, shutdown_opentelemetry, trace_function, traced_operation, add_trace_context_to_logs
-from opentelemetry import trace, metrics, baggage
-from opentelemetry.trace import Status, StatusCode
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-
-# Initialize OpenTelemetry for the main API
-tracer, meter = initialize_opentelemetry(
-    service_name="document-rag-ui-api",
-    service_version=os.getenv("OTEL_SERVICE_VERSION", "1.0.0"),
-    environment=os.getenv("OTEL_ENVIRONMENT", "development")
-)
-
-# Setup logging with trace context
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-add_trace_context_to_logs()
 
-# Define metrics
-query_counter = meter.create_counter(
-    "api_queries_total",
-    description="Total number of API queries processed"
-)
-query_duration = meter.create_histogram(
-    "api_query_duration_seconds",
-    description="Time taken to process queries"
-)
-websocket_connections = meter.create_up_down_counter(
-    "api_websocket_connections_active",
-    description="Number of active WebSocket connections"
-)
-
-# Basic components - no enhanced pipeline imports
-from enum import Enum
-
-class CitationFormat(Enum):
-    APA = "apa"
-    MLA = "mla"
-    CHICAGO = "chicago"
-
-class MessageType(Enum):
-    USER = "user"
-    ASSISTANT = "assistant"
-    SYSTEM = "system"
-
-# Mock enhanced components (not available)
-BM25IndexManager = None
-ContextAwareQueryEngine = None
-EnhancedRetriever = None
-ResponseGenerator = None
-ConversationContext = None
-SourceAttributionProcessor = None
+# Import enhanced pipeline components
+try:
+    from pipeline.query_engine.hybrid_search import BM25IndexManager
+    from pipeline.query_engine.context_aware_query_engine import ContextAwareQueryEngine
+    from pipeline.query_engine.enhanced_retrieval import EnhancedRetriever
+    from pipeline.query_engine.response_generator import ResponseGenerator
+    from pipeline.context_management.conversation_context import ConversationContext, MessageType
+    from pipeline.processing.source_attribution import CitationFormat, SourceAttributionProcessor
+    logger.info("✅ Successfully imported enhanced pipeline components")
+except ImportError as e:
+    logger.warning(f"⚠️ Could not import enhanced components: {e}")
+    # Fallback to basic components
+    from enum import Enum
+    
+    class CitationFormat(Enum):
+        APA = "apa"
+        MLA = "mla"
+        CHICAGO = "chicago"
+    
+    class MessageType(Enum):
+        USER = "user"
+        ASSISTANT = "assistant"
+        SYSTEM = "system"
+    
+    # Mock enhanced components
+    BM25IndexManager = None
+    ContextAwareQueryEngine = None
+    EnhancedRetriever = None
+    ResponseGenerator = None
+    ConversationContext = None
+    SourceAttributionProcessor = None
 
 # Basic imports that should always work
 from qdrant_client import QdrantClient
@@ -140,27 +121,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Instrument FastAPI with OpenTelemetry
-FastAPIInstrumentor.instrument_app(app, tracer_provider=trace.get_tracer_provider())
-
-# Add startup and shutdown events for OpenTelemetry
-@app.on_event("startup")
-async def startup_event():
-    """Application startup event with tracing"""
-    with traced_operation("api_application_startup") as span:
-        span.add_event("fastapi_application_started")
-        logger.info("🚀 Enhanced Document RAG API started with OpenTelemetry instrumentation")
-        # Initialize the query engine
-        await initialize_query_engine()
-
-@app.on_event("shutdown") 
-async def shutdown_event():
-    """Application shutdown event with tracing"""
-    with traced_operation("api_application_shutdown") as span:
-        span.add_event("fastapi_application_shutdown")
-        logger.info("🛑 Enhanced Document RAG API shutting down")
-        shutdown_opentelemetry()
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="ui/static"), name="static")
@@ -450,8 +410,8 @@ Please provide a detailed answer based on the context provided. If the context d
 # Initialize enhanced query engine
 enhanced_query_engine = None
 
-# Initialize the enhanced query engine on startup
-async def initialize_query_engine():
+@app.on_event("startup")
+async def startup_event():
     """Initialize the enhanced query engine on startup"""
     global enhanced_query_engine
     logger.info("🚀 Starting Enhanced Document RAG API...")
@@ -462,8 +422,6 @@ async def initialize_query_engine():
     except Exception as e:
         logger.error(f"❌ Failed to initialize enhanced query engine: {e}")
         enhanced_query_engine = None
-
-# Call initialization in the existing startup event
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
@@ -477,91 +435,29 @@ async def read_root():
 @app.post("/api/query", response_model=QueryResponse)
 async def process_query(request: QueryRequest):
     """Process a user query and return enhanced results"""
-    import time
-    start_time = time.time()
+    if not enhanced_query_engine:
+        raise HTTPException(status_code=503, detail="Enhanced query engine not initialized")
     
-    with traced_operation("query_processing") as span:
-        try:
-            # Set trace attributes
-            span.set_attribute("query.text", request.query[:100] + "..." if len(request.query) > 100 else request.query)
-            span.set_attribute("query.session_id", request.session_id or "new")
-            span.set_attribute("query.user_id", request.user_id or "anonymous")
-            span.set_attribute("query.citation_format", request.citation_format)
-            span.set_attribute("query.response_style", request.response_style)
-            span.set_attribute("query.max_sources", request.max_sources)
-            
-            if not enhanced_query_engine:
-                span.set_attribute("query.engine_initialized", False)
-                span.add_event("query_engine_not_initialized")
-                raise HTTPException(status_code=503, detail="Enhanced query engine not initialized")
-            
-            span.set_attribute("query.engine_initialized", True)
-            
-            # Create session if not exists
-            session_id = request.session_id or str(uuid.uuid4())
-            is_new_session = session_id not in sessions
-            
-            span.set_attribute("session.id", session_id)
-            span.set_attribute("session.is_new", is_new_session)
-            
-            if is_new_session:
-                sessions[session_id] = SessionInfo(
-                    session_id=session_id,
-                    message_count=0,
-                    current_topic=None,
-                    created_at=datetime.now(timezone.utc).isoformat(),
-                    last_activity=datetime.now(timezone.utc).isoformat(),
-                    metadata={}
-                )
-                span.add_event("new_session_created", {"session_id": session_id})
-            
-            # Update session
-            sessions[session_id].message_count += 1
-            sessions[session_id].last_activity = datetime.now(timezone.utc).isoformat()
-            
-            span.set_attribute("session.message_count", sessions[session_id].message_count)
-            
-            # Process query with enhanced engine
-            span.add_event("query_processing_started")
-            response = await enhanced_query_engine.process_query(request)
-            
-            # Record metrics
-            processing_duration = time.time() - start_time
-            query_counter.add(1, {
-                "session_type": "new" if is_new_session else "existing",
-                "citation_format": request.citation_format,
-                "response_style": request.response_style
-            })
-            query_duration.record(processing_duration, {
-                "citation_format": request.citation_format,
-                "response_style": request.response_style
-            })
-            
-            span.set_attribute("query.processing_duration", processing_duration)
-            span.set_attribute("query.result_status", "success")
-            span.add_event("query_processing_completed", {
-                "duration_seconds": processing_duration,
-                "sources_count": len(response.sources) if hasattr(response, 'sources') else 0
-            })
-            
-            return response
-            
-        except HTTPException:
-            # Re-raise HTTP exceptions
-            raise
-        except Exception as e:
-            processing_duration = time.time() - start_time
-            span.record_exception(e)
-            span.set_attribute("query.result_status", "error")
-            span.set_attribute("query.error_type", type(e).__name__)
-            span.add_event("query_processing_failed", {
-                "error_type": type(e).__name__,
-                "error_message": str(e),
-                "duration_seconds": processing_duration
-            })
-            
-            logger.error(f"Error processing query: {e}")
-            raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+    # Create session if not exists
+    session_id = request.session_id or str(uuid.uuid4())
+    if session_id not in sessions:
+        sessions[session_id] = SessionInfo(
+            session_id=session_id,
+            message_count=0,
+            current_topic=None,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            last_activity=datetime.now(timezone.utc).isoformat(),
+            metadata={}
+        )
+    
+    # Update session
+    sessions[session_id].message_count += 1
+    sessions[session_id].last_activity = datetime.now(timezone.utc).isoformat()
+    
+    # Process query with enhanced engine
+    response = await enhanced_query_engine.process_query(request)
+    
+    return response
 
 @app.get("/api/sessions/{session_id}")
 async def get_session(session_id: str):

@@ -47,74 +47,16 @@ from text_splitting import split_documents
 from dotenv import load_dotenv
 load_dotenv()
 
-# Initialize OpenTelemetry early
-from otel_config import initialize_opentelemetry, shutdown_opentelemetry, trace_function, traced_operation, add_trace_context_to_logs
-from opentelemetry import trace, metrics, baggage
-from opentelemetry.trace import Status, StatusCode
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-
-# Initialize OpenTelemetry for the backend service
-tracer, meter = initialize_opentelemetry(
-    service_name="document-rag-backend",
-    service_version="1.0.0"
-)
-
-# Configure logging with trace context
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - [trace_id=%(trace_id)s span_id=%(span_id)s] - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
         logging.FileHandler('backend_service.log')
     ]
 )
 logger = logging.getLogger(__name__)
-
-# Add trace context to logs
-add_trace_context_to_logs()
-
-# Create metrics for backend service monitoring
-file_processing_counter = meter.create_counter(
-    "documents_processed_total",
-    description="Total number of documents processed",
-    unit="1"
-)
-
-file_processing_duration = meter.create_histogram(
-    "document_processing_duration_seconds",
-    description="Time taken to process documents",
-    unit="s"
-)
-
-embedding_operations = meter.create_counter(
-    "embedding_operations_total",
-    description="Total number of embedding operations",
-    unit="1"
-)
-
-qdrant_operations = meter.create_counter(
-    "qdrant_operations_total", 
-    description="Total number of Qdrant operations",
-    unit="1"
-)
-
-google_drive_operations = meter.create_counter(
-    "google_drive_operations_total",
-    description="Total number of Google Drive operations", 
-    unit="1"
-)
-
-active_processing_gauge = meter.create_up_down_counter(
-    "active_document_processing",
-    description="Number of documents currently being processed",
-    unit="1"
-)
-
-database_operations = meter.create_counter(
-    "database_operations_total",
-    description="Total number of database operations",
-    unit="1"
-)
 
 @dataclass
 class ProcessedFile:
@@ -159,123 +101,55 @@ class FileFingerprintDatabase:
                 CREATE INDEX IF NOT EXISTS idx_file_name ON processed_files(file_name)
             """)
     
-    @trace_function("database.is_file_processed", {"component": "database", "operation": "query"})
     def is_file_processed(self, file_path: str, file_hash: str) -> bool:
         """Check if a file has already been processed"""
-        with traced_operation("file_processed_check") as span:
-            span.set_attribute("file.path", file_path)
-            span.set_attribute("file.hash", file_hash[:16] + "...")  # Truncate hash for security
-            span.set_attribute("db.operation", "SELECT")
-            span.set_attribute("db.table", "processed_files")
-            
-            database_operations.add(1, {"operation": "select", "table": "processed_files"})
-            
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute(
-                    "SELECT COUNT(*) FROM processed_files WHERE file_path = ? AND file_hash = ?",
-                    (file_path, file_hash)
-                )
-                count = cursor.fetchone()[0]
-                is_processed = count > 0
-                
-                span.set_attribute("query.result.count", count)
-                span.set_attribute("file.is_processed", is_processed)
-                span.add_event("file_processed_check_complete", {
-                    "is_processed": is_processed,
-                    "count": count
-                })
-                
-                return is_processed
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM processed_files WHERE file_path = ? AND file_hash = ?",
+                (file_path, file_hash)
+            )
+            return cursor.fetchone()[0] > 0
     
-    @trace_function("qdrant.is_file_in_qdrant", {"component": "qdrant", "operation": "search"})
     def is_file_in_qdrant(self, file_path: str, qdrant_client) -> bool:
         """Check if a file already has embeddings in Qdrant"""
-        with traced_operation("qdrant_file_check") as span:
-            span.set_attribute("file.path", file_path)
-            span.set_attribute("qdrant.collection", "documents")
-            span.set_attribute("qdrant.operation", "scroll")
-            
-            qdrant_operations.add(1, {"operation": "scroll", "collection": "documents"})
-            
-            try:
-                # Search for any points with this file_path in metadata
-                search_result = qdrant_client.scroll(
-                    collection_name="documents",
-                    scroll_filter={
-                        "must": [
-                            {
-                                "key": "file_path",
-                                "match": {"value": file_path}
-                            }
-                        ]
-                    },
-                    limit=1,
-                    with_payload=True
-                )
-                
-                points_found = len(search_result[0])
-                file_exists = points_found > 0
-                
-                span.set_attribute("qdrant.search.points_found", points_found)
-                span.set_attribute("file.exists_in_qdrant", file_exists)
-                span.add_event("qdrant_file_check_complete", {
-                    "file_exists": file_exists,
-                    "points_found": points_found
-                })
-                
-                return file_exists
-                
-            except Exception as e:
-                span.record_exception(e)
-                span.set_attribute("qdrant.error.type", type(e).__name__)
-                span.set_attribute("qdrant.error.message", str(e))
-                span.add_event("qdrant_file_check_error", {
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                    "assumption": "file_not_processed"
-                })
-                # If there's an error (like collection doesn't exist), assume not processed
-                return False
+        try:
+            # Search for any points with this file_path in metadata
+            search_result = qdrant_client.scroll(
+                collection_name="documents",
+                scroll_filter={
+                    "must": [
+                        {
+                            "key": "file_path",
+                            "match": {"value": file_path}
+                        }
+                    ]
+                },
+                limit=1,
+                with_payload=True
+            )
+            return len(search_result[0]) > 0
+        except Exception as e:
+            # If there's an error (like collection doesn't exist), assume not processed
+            return False
     
-    @trace_function("database.mark_file_processed", {"component": "database", "operation": "insert"})
     def mark_file_processed(self, processed_file: ProcessedFile):
         """Mark a file as processed"""
-        with traced_operation("mark_file_processed") as span:
-            span.set_attribute("file.id", processed_file.file_id)
-            span.set_attribute("file.name", processed_file.file_name)
-            span.set_attribute("file.path", processed_file.file_path)
-            span.set_attribute("file.hash", processed_file.file_hash[:16] + "...")
-            span.set_attribute("file.document_count", processed_file.document_count)
-            span.set_attribute("file.size", processed_file.file_size)
-            span.set_attribute("file.mime_type", processed_file.mime_type)
-            span.set_attribute("file.qdrant_points", len(processed_file.qdrant_point_ids))
-            span.set_attribute("db.operation", "INSERT OR REPLACE")
-            span.set_attribute("db.table", "processed_files")
-            
-            database_operations.add(1, {"operation": "insert", "table": "processed_files"})
-            
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO processed_files 
-                    (file_id, file_name, file_path, file_hash, processed_at, document_count, file_size, mime_type, qdrant_point_ids)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    processed_file.file_id,
-                    processed_file.file_name,
-                    processed_file.file_path,
-                    processed_file.file_hash,
-                    processed_file.processed_at,
-                    processed_file.document_count,
-                    processed_file.file_size,
-                    processed_file.mime_type,
-                    json.dumps(processed_file.qdrant_point_ids)
-                ))
-                
-                span.add_event("file_marked_processed", {
-                    "file_id": processed_file.file_id,
-                    "document_count": processed_file.document_count,
-                    "qdrant_points": len(processed_file.qdrant_point_ids)
-                })
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO processed_files 
+                (file_id, file_name, file_path, file_hash, processed_at, document_count, file_size, mime_type, qdrant_point_ids)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                processed_file.file_id,
+                processed_file.file_name,
+                processed_file.file_path,
+                processed_file.file_hash,
+                processed_file.processed_at,
+                processed_file.document_count,
+                processed_file.file_size,
+                processed_file.mime_type,
+                json.dumps(processed_file.qdrant_point_ids)
+            ))
     
     def get_processed_files(self, limit: int = 100) -> List[ProcessedFile]:
         """Get list of processed files"""
@@ -330,271 +204,129 @@ class FileFingerprintDatabase:
             conn.commit()
 
 class DocumentProcessor:
-    """Handles document processing and embedding with OpenTelemetry instrumentation"""
+    """Handles document processing and embedding"""
     
-    @trace_function("document_processor.init", {"component": "document_processor", "operation": "initialization"})
     def __init__(self, 
                  qdrant_url: str = "http://localhost:6333",
                  collection_name: str = "documents",
                  embedding_model: str = "text-embedding-3-large"):
-        with traced_operation("document_processor_initialization") as span:
-            self.qdrant_url = qdrant_url
-            self.collection_name = collection_name
-            self.embedding_model = embedding_model
-            
-            span.set_attribute("qdrant.url", qdrant_url)
-            span.set_attribute("qdrant.collection", collection_name)
-            span.set_attribute("embedding.model", embedding_model)
-            span.add_event("initializing_components")
-            
-            # Initialize components
-            self.embeddings = OpenAIEmbeddings(model=embedding_model)
-            self.qdrant_client = QdrantClient(url=qdrant_url)
-            self.vector_store = None
-            
-            span.add_event("components_initialized")
-            
-            # Initialize collection
-            self._ensure_collection_exists()
-            
-            span.add_event("document_processor_ready")
-            logger.info(f"✅ Document processor initialized with collection: {collection_name}")
+        self.qdrant_url = qdrant_url
+        self.collection_name = collection_name
+        self.embedding_model = embedding_model
+        
+        # Initialize components
+        self.embeddings = OpenAIEmbeddings(model=embedding_model)
+        self.qdrant_client = QdrantClient(url=qdrant_url)
+        self.vector_store = None
+        
+        # Initialize collection
+        self._ensure_collection_exists()
+        
+        logger.info(f"✅ Document processor initialized with collection: {collection_name}")
     
-    @trace_function("qdrant.ensure_collection_exists", {"component": "qdrant", "operation": "collection_setup"})
     def _ensure_collection_exists(self):
         """Ensure the Qdrant collection exists"""
-        with traced_operation("qdrant_collection_setup") as span:
-            span.set_attribute("qdrant.collection", self.collection_name)
-            span.set_attribute("qdrant.vector_size", 3072)
-            span.set_attribute("qdrant.distance_metric", "COSINE")
+        try:
+            collections = self.qdrant_client.get_collections()
+            collection_names = [col.name for col in collections.collections]
             
-            try:
-                qdrant_operations.add(1, {"operation": "get_collections", "collection": self.collection_name})
-                collections = self.qdrant_client.get_collections()
-                collection_names = [col.name for col in collections.collections]
-                
-                span.set_attribute("qdrant.existing_collections.count", len(collection_names))
-                span.add_event("collections_retrieved", {"count": len(collection_names)})
-                
-                if self.collection_name not in collection_names:
-                    span.set_attribute("qdrant.collection.exists", False)
-                    span.add_event("creating_collection", {"collection": self.collection_name})
-                    logger.info(f"📦 Creating collection: {self.collection_name}")
-                    
-                    qdrant_operations.add(1, {"operation": "create_collection", "collection": self.collection_name})
-                    self.qdrant_client.create_collection(
-                        collection_name=self.collection_name,
-                        vectors_config=VectorParams(size=3072, distance=Distance.COSINE)  # text-embedding-3-large
-                    )
-                    
-                    span.add_event("collection_created", {"collection": self.collection_name})
-                    logger.info(f"✅ Collection '{self.collection_name}' created")
-                else:
-                    span.set_attribute("qdrant.collection.exists", True)
-                    span.add_event("collection_already_exists", {"collection": self.collection_name})
-                    logger.info(f"✅ Collection '{self.collection_name}' already exists")
-                    
-                # Initialize vector store
-                span.add_event("initializing_vector_store")
-                self.vector_store = QdrantVectorStore(
-                    client=self.qdrant_client,
+            if self.collection_name not in collection_names:
+                logger.info(f"📦 Creating collection: {self.collection_name}")
+                self.qdrant_client.create_collection(
                     collection_name=self.collection_name,
-                    embedding=self.embeddings
+                    vectors_config=VectorParams(size=3072, distance=Distance.COSINE)  # text-embedding-3-large
                 )
-                span.add_event("vector_store_initialized")
+                logger.info(f"✅ Collection '{self.collection_name}' created")
+            else:
+                logger.info(f"✅ Collection '{self.collection_name}' already exists")
                 
-            except Exception as e:
-                span.record_exception(e)
-                span.set_attribute("qdrant.error.type", type(e).__name__)
-                span.set_attribute("qdrant.error.message", str(e))
-                span.add_event("collection_setup_failed", {
-                    "error_type": type(e).__name__,
-                    "error_message": str(e)
-                })
-                logger.error(f"❌ Failed to initialize collection: {e}")
-                raise
+            # Initialize vector store
+            self.vector_store = QdrantVectorStore(
+                client=self.qdrant_client,
+                collection_name=self.collection_name,
+                embedding=self.embeddings
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize collection: {e}")
+            raise
     
-    @trace_function("document_processor.process_documents", {"component": "document_processor", "operation": "embedding"})
     def process_documents(self, documents: List[Document], file_info: Dict) -> List[str]:
         """Process documents and add to Qdrant, return point IDs"""
-        processing_start_time = time.time()
-        
-        with traced_operation("document_processing") as span:
-            span.set_attribute("file.name", file_info.get("file_name", "unknown"))
-            span.set_attribute("file.path", file_info.get("file_path", "unknown"))
-            span.set_attribute("file.size", file_info.get("file_size", 0))
-            span.set_attribute("file.mime_type", file_info.get("mime_type", "unknown"))
-            span.set_attribute("documents.input_count", len(documents))
+        try:
+            if not documents:
+                return []
             
-            active_processing_gauge.add(1, {"file_type": file_info.get("mime_type", "unknown")})
+            # Split documents into chunks
+            chunks = split_documents(documents, chunk_size=1000, chunk_overlap=120)
+            logger.info(f"📄 Split into {len(chunks)} chunks")
             
-            try:
-                if not documents:
-                    span.set_attribute("processing.result", "skipped_empty")
-                    span.add_event("processing_skipped", {"reason": "no_documents"})
-                    return []
-                
-                # Split documents into chunks
-                span.add_event("chunking_documents")
-                chunks = split_documents(documents, chunk_size=1000, chunk_overlap=120)
-                
-                span.set_attribute("documents.chunks_count", len(chunks))
-                span.set_attribute("chunking.chunk_size", 1000)
-                span.set_attribute("chunking.overlap", 120)
-                span.add_event("documents_chunked", {"chunks_count": len(chunks)})
-                logger.info(f"📄 Split into {len(chunks)} chunks")
-                
-                if not chunks:
-                    span.set_attribute("processing.result", "skipped_no_chunks")
-                    span.add_event("processing_skipped", {"reason": "no_chunks_after_splitting"})
-                    return []
-                
-                # Add metadata
-                span.add_event("adding_metadata")
-                for chunk in chunks:
-                    chunk.metadata.update({
-                        "file_id": file_info.get("file_id", "unknown"),
-                        "file_name": file_info.get("file_name", "unknown"),
-                        "file_path": file_info.get("file_path", "unknown"),
-                        "processed_at": datetime.now().isoformat(),
-                        "file_size": file_info.get("file_size", 0),
-                        "mime_type": file_info.get("mime_type", "unknown")
-                    })
-                span.add_event("metadata_added")
-                
-                # Generate embeddings and add to Qdrant
-                point_ids = []
-                batch_size = 10
-                total_batches = (len(chunks) + batch_size - 1) // batch_size
-                
-                span.set_attribute("embedding.batch_size", batch_size)
-                span.set_attribute("embedding.total_batches", total_batches)
-                span.add_event("embedding_processing_start", {
-                    "total_chunks": len(chunks),
-                    "batch_size": batch_size,
-                    "total_batches": total_batches
+            if not chunks:
+                return []
+            
+            # Add metadata
+            for chunk in chunks:
+                chunk.metadata.update({
+                    "file_id": file_info.get("file_id", "unknown"),
+                    "file_name": file_info.get("file_name", "unknown"),
+                    "file_path": file_info.get("file_path", "unknown"),
+                    "processed_at": datetime.now().isoformat(),
+                    "file_size": file_info.get("file_size", 0),
+                    "mime_type": file_info.get("mime_type", "unknown")
                 })
+            
+            # Generate embeddings and add to Qdrant
+            point_ids = []
+            batch_size = 10
+            
+            for i in range(0, len(chunks), batch_size):
+                batch = chunks[i:i + batch_size]
                 
-                for i in range(0, len(chunks), batch_size):
-                    batch_num = i // batch_size + 1
-                    batch = chunks[i:i + batch_size]
-                    
-                    with traced_operation(f"embedding_batch_{batch_num}") as batch_span:
-                        batch_span.set_attribute("batch.number", batch_num)
-                        batch_span.set_attribute("batch.size", len(batch))
-                        batch_span.set_attribute("batch.total_batches", total_batches)
-                        
-                        # Generate unique point IDs
-                        batch_point_ids = [
-                            hashlib.md5(f"{file_info['file_path']}_{i+j}_{chunk.page_content[:100]}".encode()).hexdigest()
-                            for j, chunk in enumerate(batch)
-                        ]
-                        
-                        batch_span.set_attribute("batch.point_ids_count", len(batch_point_ids))
-                        batch_span.add_event("point_ids_generated", {"count": len(batch_point_ids)})
-                        
-                        # Add to vector store
-                        embedding_operations.add(1, {"operation": "add_documents", "batch_size": len(batch)})
-                        qdrant_operations.add(1, {"operation": "add_documents", "collection": self.collection_name})
-                        
-                        self.vector_store.add_documents(batch, ids=batch_point_ids)
-                        point_ids.extend(batch_point_ids)
-                        
-                        batch_span.add_event("batch_processed", {
-                            "batch_number": batch_num,
-                            "documents_added": len(batch),
-                            "point_ids_added": len(batch_point_ids)
-                        })
-                        
-                        logger.info(f"✅ Processed batch {batch_num}/{total_batches}")
-                        
-                        # Small delay to avoid overwhelming the system
-                        time.sleep(0.1)
+                # Generate unique point IDs
+                batch_point_ids = [
+                    hashlib.md5(f"{file_info['file_path']}_{i+j}_{chunk.page_content[:100]}".encode()).hexdigest()
+                    for j, chunk in enumerate(batch)
+                ]
                 
-                processing_duration = time.time() - processing_start_time
-                file_processing_duration.record(processing_duration, {
-                    "file_type": file_info.get("mime_type", "unknown"),
-                    "status": "success"
-                })
-                file_processing_counter.add(1, {
-                    "file_type": file_info.get("mime_type", "unknown"),
-                    "status": "success"
-                })
+                # Add to vector store
+                self.vector_store.add_documents(batch, ids=batch_point_ids)
+                point_ids.extend(batch_point_ids)
                 
-                span.set_attribute("processing.result", "success")
-                span.set_attribute("processing.duration_seconds", processing_duration)
-                span.set_attribute("processing.chunks_processed", len(chunks))
-                span.set_attribute("processing.points_created", len(point_ids))
-                span.add_event("document_processing_complete", {
-                    "chunks_processed": len(chunks),
-                    "points_created": len(point_ids),
-                    "duration_seconds": processing_duration
-                })
+                logger.info(f"✅ Processed batch {i//batch_size + 1}/{(len(chunks) + batch_size - 1)//batch_size}")
                 
-                logger.info(f"✅ Successfully processed {len(chunks)} chunks with {len(point_ids)} points")
-                return point_ids
-                
-            except Exception as e:
-                processing_duration = time.time() - processing_start_time
-                file_processing_duration.record(processing_duration, {
-                    "file_type": file_info.get("mime_type", "unknown"),
-                    "status": "error"
-                })
-                file_processing_counter.add(1, {
-                    "file_type": file_info.get("mime_type", "unknown"),
-                    "status": "error"
-                })
-                
-                span.record_exception(e)
-                span.set_attribute("processing.result", "error")
-                span.set_attribute("processing.error.type", type(e).__name__)
-                span.set_attribute("processing.error.message", str(e))
-                span.add_event("document_processing_failed", {
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                    "duration_seconds": processing_duration
-                })
-                
-                logger.error(f"❌ Failed to process documents: {e}")
-                raise
-            finally:
-                active_processing_gauge.add(-1, {"file_type": file_info.get("mime_type", "unknown")})
+                # Small delay to avoid overwhelming the system
+                time.sleep(0.1)
+            
+            logger.info(f"✅ Successfully processed {len(chunks)} chunks with {len(point_ids)} points")
+            return point_ids
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to process documents: {e}")
+            raise
 
 class BackendService:
     """Main backend service for continuous file monitoring and processing"""
     
-    @trace_function("backend_service.init", {"component": "backend_service", "operation": "initialization"})
     def __init__(self):
-        with traced_operation("backend_service_initialization") as span:
-            # Configuration
-            self.google_drive_folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-            self.local_watch_dirs = os.getenv("LOCAL_WATCH_DIRS", "").split(",") if os.getenv("LOCAL_WATCH_DIRS") else []
-            self.scan_interval = int(os.getenv("SCAN_INTERVAL", "60"))  # seconds
-            
-            span.set_attribute("config.google_drive_folder_id", bool(self.google_drive_folder_id))
-            span.set_attribute("config.local_watch_dirs_count", len(self.local_watch_dirs))
-            span.set_attribute("config.scan_interval", self.scan_interval)
-            
-            # Initialize components
-            self.fingerprint_db = FileFingerprintDatabase()
-            self.processor = DocumentProcessor()
-            self.google_drive_loader = None
-            
-            # Service state
-            self.is_running = False
-            self.stats = {
-                "service_started": datetime.now(),
-                "files_processed": 0,
-                "documents_created": 0,
-                "last_scan": None,
-                "errors": []
-            }
-            
-            span.add_event("backend_service_initialized", {
-                "google_drive_enabled": bool(self.google_drive_folder_id),
-                "local_dirs_count": len(self.local_watch_dirs),
-                "scan_interval": self.scan_interval
-            })
+        # Configuration
+        self.google_drive_folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+        self.local_watch_dirs = os.getenv("LOCAL_WATCH_DIRS", "").split(",") if os.getenv("LOCAL_WATCH_DIRS") else []
+        self.scan_interval = int(os.getenv("SCAN_INTERVAL", "60"))  # seconds
+        
+        # Initialize components
+        self.fingerprint_db = FileFingerprintDatabase()
+        self.processor = DocumentProcessor()
+        self.google_drive_loader = None
+        
+        # Service state
+        self.is_running = False
+        self.stats = {
+            "service_started": datetime.now(),
+            "files_processed": 0,
+            "documents_created": 0,
+            "last_scan": None,
+            "errors": []
+        }
         
         # Initialize Google Drive loader if configured
         if self.google_drive_folder_id:
@@ -927,61 +659,28 @@ class BackendService:
             logger.error(f"Full traceback: {traceback.format_exc()}")
             self.stats["errors"].append(f"Scan cycle error: {e}")
     
-    @trace_function("backend_service.start_monitoring", {"component": "backend_service", "operation": "monitoring_loop"})
     async def start_monitoring(self):
         """Start the continuous monitoring service"""
-        with traced_operation("monitoring_service_lifecycle") as span:
-            self.is_running = True
-            span.set_attribute("service.is_running", self.is_running)
-            span.set_attribute("service.scan_interval", self.scan_interval)
-            span.add_event("monitoring_service_started", {"scan_interval": self.scan_interval})
-            
-            logger.info(f"🚀 Starting continuous monitoring service...")
-            logger.info(f"⏱️ Scan interval: {self.scan_interval} seconds")
-            
-            scan_count = 0
-            error_count = 0
-            
-            while self.is_running:
-                try:
-                    with traced_operation(f"monitoring_scan_{scan_count}") as scan_span:
-                        scan_span.set_attribute("scan.number", scan_count)
-                        scan_span.set_attribute("scan.interval", self.scan_interval)
-                        
-                        self.scan_and_process()
-                        scan_count += 1
-                        
-                        scan_span.add_event("scan_completed", {"scan_number": scan_count})
+        self.is_running = True
+        logger.info(f"🚀 Starting continuous monitoring service...")
+        logger.info(f"⏱️ Scan interval: {self.scan_interval} seconds")
+        
+        while self.is_running:
+            try:
+                self.scan_and_process()
+                
+                # Wait for next scan
+                for _ in range(self.scan_interval):
+                    if not self.is_running:
+                        break
+                    await asyncio.sleep(1)
                     
-                    # Wait for next scan
-                    for _ in range(self.scan_interval):
-                        if not self.is_running:
-                            break
-                        await asyncio.sleep(1)
-                        
-                except Exception as e:
-                    error_count += 1
-                    span.record_exception(e)
-                    span.set_attribute("service.error_count", error_count)
-                    span.add_event("monitoring_error", {
-                        "error_type": type(e).__name__,
-                        "error_message": str(e),
-                        "scan_number": scan_count,
-                        "error_count": error_count
-                    })
-                    
-                    logger.error(f"❌ Error in monitoring loop: {e}")
-                    self.stats["errors"].append(f"Monitoring loop error: {e}")
-                    await asyncio.sleep(10)  # Wait before retrying
-            
-            span.set_attribute("service.total_scans", scan_count)
-            span.set_attribute("service.total_errors", error_count)
-            span.add_event("monitoring_service_stopped", {
-                "total_scans": scan_count,
-                "total_errors": error_count
-            })
-            
-            logger.info("🛑 Monitoring service stopped")
+            except Exception as e:
+                logger.error(f"❌ Error in monitoring loop: {e}")
+                self.stats["errors"].append(f"Monitoring loop error: {e}")
+                await asyncio.sleep(10)  # Wait before retrying
+        
+        logger.info("🛑 Monitoring service stopped")
     
     def stop_monitoring(self):
         """Stop the monitoring service"""
@@ -1065,49 +764,26 @@ async def root():
     return {"message": "Document Processing Backend Service", "status": "running"}
 
 @app.get("/status")
-@trace_function("api.get_status", {"component": "backend_api", "operation": "status_check"})
 async def get_status():
     """Get service status"""
-    with traced_operation("status_check") as span:
-        if not service:
-            span.set_attribute("status.service_initialized", False)
-            span.add_event("service_not_initialized")
-            raise HTTPException(status_code=503, detail="Service not initialized")
-        
-        span.set_attribute("status.service_initialized", True)
-        status = service.get_status()
-        span.set_attribute("status.is_running", status.get("service", {}).get("is_running", False))
-        span.set_attribute("status.files_processed", status.get("processing", {}).get("files_processed_session", 0))
-        span.add_event("status_retrieved", {
-            "is_running": status.get("service", {}).get("is_running", False),
-            "files_processed": status.get("processing", {}).get("files_processed_session", 0)
-        })
-        
-        return status
+    if not service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    return service.get_status()
 
 @app.post("/scan")
-@trace_function("api.trigger_scan", {"component": "backend_api", "operation": "manual_scan"})
 async def trigger_scan():
     """Manually trigger a scan for new files"""
-    with traced_operation("manual_scan_trigger") as span:
-        if not service:
-            span.set_attribute("scan.service_initialized", False)
-            span.add_event("service_not_initialized")
-            raise HTTPException(status_code=503, detail="Service not initialized")
-        
-        if not service.is_running:
-            span.set_attribute("scan.service_running", False)
-            span.add_event("service_not_running")
-            raise HTTPException(status_code=503, detail="Service not running")
-        
-        span.set_attribute("scan.service_initialized", True)
-        span.set_attribute("scan.service_running", True)
-        span.add_event("manual_scan_triggered")
-        
-        # Trigger scan in background
-        asyncio.create_task(asyncio.to_thread(service.scan_and_process))
-        
-        return {"message": "Scan triggered successfully"}
+    if not service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    if not service.is_running:
+        raise HTTPException(status_code=503, detail="Service not running")
+    
+    # Trigger scan in background
+    asyncio.create_task(asyncio.to_thread(service.scan_and_process))
+    
+    return {"message": "Scan triggered successfully"}
 
 @app.post("/stop")
 async def stop_service():

@@ -59,21 +59,12 @@ exporters:
   prometheus:
     endpoint: "0.0.0.0:8889"
     namespace: document_rag
-    # Remove const_labels to avoid duplicate label names
-    # const_labels:
-    #   environment: development
 
-  # Console exporter for debugging (replaced logging)
+  # Console exporter for debugging
   debug:
     verbosity: normal
     sampling_initial: 5
     sampling_thereafter: 200
-
-  # OTLP exporter (for forwarding to other collectors)
-  otlp:
-    endpoint: http://localhost:4317
-    tls:
-      insecure: true
 
 service:
   pipelines:

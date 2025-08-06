@@ -64,38 +64,12 @@ If you want automatic document monitoring:
 5. Download `credentials.json` to the project root
 6. Set `GOOGLE_DRIVE_FOLDER_ID` in `.env`
 
-### 5. Start Observability Stack (Optional but Recommended)
-
-For production monitoring and debugging, start the OpenTelemetry observability stack:
-
-```bash
-# Start Jaeger, Prometheus, Grafana, and OpenTelemetry Collector
-./start_observability.sh
-```
-
-This provides:
-- **🔍 Distributed Tracing**: End-to-end request tracing with Jaeger
-- **📊 Metrics Collection**: Performance metrics with Prometheus  
-- **📈 Visualization**: Dashboards with Grafana
-- **🔗 Correlation**: Unified trace and span IDs across all services
-
-**Observability Access Points:**
-- **Jaeger (Tracing)**: http://localhost:16686
-- **Prometheus (Metrics)**: http://localhost:9090
-- **Grafana (Dashboards)**: http://localhost:3000 (admin/admin)
-
-### 6. Run the System
+### 5. Run the System
 
 ```bash
 # Start the complete system (backend + API + UI)
 python start_complete_system.py
 ```
-
-The system now includes comprehensive OpenTelemetry instrumentation for:
-- ✅ Distributed tracing across all services
-- ✅ Performance metrics and monitoring
-- ✅ Structured logging with trace correlation
-- ✅ Real-time observability dashboards
 
 ## 🌐 Access Points
 
@@ -158,11 +132,6 @@ Google Drive → Document Loaders → Text Splitting → OpenAI Embeddings → Q
 - **Real-time Document Monitoring**: Automatically processes new Google Drive files
 - **Intelligent Chunking**: Optimized text splitting for better retrieval
 - **Multi-format Support**: Handles various document formats seamlessly
-- **🔭 OpenTelemetry Observability**: Comprehensive distributed tracing, metrics, and logging
-  - End-to-end request tracing across all services
-  - Performance metrics and real-time monitoring
-  - Structured logging with trace correlation
-  - Integration with Jaeger, Prometheus, and Grafana
 
 ## 🛠️ Development & Customization
 
@@ -186,49 +155,18 @@ The system provides RESTful API endpoints:
 - `GET /api/status` - System status
 - `GET /docs` - Interactive API documentation
 
-## 📊 Monitoring & Observability
-
-### OpenTelemetry Integration
-
-The system includes comprehensive observability with OpenTelemetry:
-
-- **Distributed Tracing**: View end-to-end request flows in Jaeger
-- **Metrics Collection**: Monitor performance with Prometheus
-- **Structured Logging**: Correlated logs with trace context
-- **Real-time Dashboards**: Visualize system health in Grafana
-
-**Quick Start:**
-```bash
-./start_observability.sh  # Start observability stack
-python start_complete_system.py  # Start instrumented application
-```
-
-**Access Points:**
-- **Jaeger**: http://localhost:16686 (Distributed tracing)
-- **Prometheus**: http://localhost:9090 (Metrics)
-- **Grafana**: http://localhost:3000 (Dashboards, admin/admin)
+## 📊 Monitoring & Logs
 
 ### Log Files
 
-- `backend_service.log` - Document processing logs with trace context
-- Console output - Real-time system status with OpenTelemetry spans
+- `backend_service.log` - Document processing logs
+- Console output - Real-time system status
 
 ### Health Checks
 
 - Backend Status: http://localhost:8001/status
 - Manual Scan: http://localhost:8001/scan
-- OpenTelemetry Collector: http://localhost:8889/metrics
 - System URLs displayed on startup
-
-### Key Metrics to Monitor
-
-- Query processing latency (p95, p99)
-- Document processing throughput
-- Error rates and success rates
-- Active WebSocket connections
-- Database operation performance
-
-For detailed setup instructions, see [OPENTELEMETRY_SETUP.md](OPENTELEMETRY_SETUP.md)
 
 ## 🔒 Security Considerations
 
