@@ -51,3 +51,21 @@ cohere
 
 # Optional: OCR Support
 easyocr
+
+
+# Core SDK + OTLP exporter
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+
+# For logging support (as part of logs signal pipeline)
+opentelemetry-exporter-otlp-proto-grpc  # required for log exporter
+
+# FastAPI / ASGI auto instrumentation
+opentelemetry-instrumentation
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-logging
+
+# Optional: requests and other HTTP libraries
+opentelemetry-instrumentation-requests
+
