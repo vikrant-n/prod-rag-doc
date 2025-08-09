@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Startup script for the Document RAG FastAPI server
+Startup script for the Document RAG FastAPI server - Clean Version
 """
 
 import os
@@ -16,9 +16,8 @@ def main():
     
     # Check if required environment variables are set
     required_vars = ["OPENAI_API_KEY"]
-    optional_vars = ["COHERE_API_KEY", "QDRANT_HOST", "QDRANT_PORT"]
-    
     missing_vars = []
+    
     for var in required_vars:
         if not os.getenv(var):
             missing_vars.append(var)
@@ -40,10 +39,10 @@ def main():
     # Start the server
     try:
         uvicorn.run(
-            "ui.api_integrated:app",
+            "ui.api_integrated_clean:app",
             host="0.0.0.0",
             port=8000,
-            reload=False,  # Set to True for development
+            reload=False,
             log_level="info"
         )
     except KeyboardInterrupt:
