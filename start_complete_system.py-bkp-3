@@ -38,16 +38,16 @@ load_dotenv()
 # Initialize OpenTelemetry - avoid conflicts with auto-instrumentation
 def init_telemetry():
     """Initialize OpenTelemetry with EDOT configuration"""
-
+    
     # Check if we're already using auto-instrumentation
     current_tracer_provider = trace.get_tracer_provider()
     if hasattr(current_tracer_provider, '__class__') and current_tracer_provider.__class__.__name__ != 'ProxyTracerProvider':
         print("✅ Using existing OpenTelemetry auto-instrumentation")
         return trace.get_tracer(__name__), metrics.get_meter(__name__)
-
+    
     # Generate unique service instance ID
     service_instance_id = f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
-
+    
     # Resource configuration
     resource = Resource.create({
         SERVICE_NAME: "document-rag-orchestrator",
@@ -58,56 +58,56 @@ def init_telemetry():
         "host.name": socket.gethostname(),
         "process.pid": str(os.getpid()),
     })
-
+    
     # OTLP endpoint configuration
     otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
-
+    
     # Only set providers if not already set
     try:
         # Trace provider setup
         trace_provider = TracerProvider(resource=resource)
         trace.set_tracer_provider(trace_provider)
-
+        
         # OTLP span exporter
         otlp_span_exporter = OTLPSpanExporter(
             endpoint=otlp_endpoint,
             insecure=True,
             headers={}
         )
-
+        
         # Add span processors
         trace_provider.add_span_processor(BatchSpanProcessor(otlp_span_exporter))
-
+        
         # Console exporter for debugging (can be removed in production)
         if os.getenv("OTEL_DEBUG", "false").lower() == "true":
             trace_provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
-
+        
         # Metrics provider setup
         otlp_metric_exporter = OTLPMetricExporter(
             endpoint=otlp_endpoint,
             insecure=True,
             headers={}
         )
-
+        
         metric_reader = PeriodicExportingMetricReader(
             exporter=otlp_metric_exporter,
             export_interval_millis=10000,  # 10 seconds
         )
-
+        
         metric_provider = MeterProvider(
             resource=resource,
             metric_readers=[metric_reader]
         )
         metrics.set_meter_provider(metric_provider)
-
+        
         print("✅ OpenTelemetry initialized with EDOT configuration")
-
+        
     except Exception as e:
         print(f"⚠️  OpenTelemetry provider already set or error: {e}")
-
+    
     # Set up propagators for distributed tracing
     set_global_textmap(B3MultiFormat())
-
+    
     # Manual instrumentation only if not using auto-instrumentation
     if not os.getenv("OTEL_PYTHON_DISABLED_INSTRUMENTATIONS"):
         try:
@@ -115,7 +115,7 @@ def init_telemetry():
             RequestsInstrumentor().instrument()
         except Exception as e:
             print(f"⚠️  Instrumentation already applied or error: {e}")
-
+    
     return trace.get_tracer(__name__), metrics.get_meter(__name__)
 
 # Initialize telemetry
@@ -143,7 +143,7 @@ process_monitoring_gauge = meter.create_up_down_counter(
 # Configure structured logging with trace correlation
 class TraceFormatter(logging.Formatter):
     """Custom formatter to include trace and span IDs"""
-
+    
     def format(self, record):
         # Get current span context
         span = trace.get_current_span()
@@ -155,7 +155,7 @@ class TraceFormatter(logging.Formatter):
         else:
             record.trace_id = '00000000000000000000000000000000'
             record.span_id = '0000000000000000'
-
+        
         return super().format(record)
 
 # Set up logging with trace correlation
@@ -179,9 +179,9 @@ def check_environment():
     """Check if all required environment variables are set"""
     with tracer.start_as_current_span("check_environment") as span:
         logger.info("🔧 Checking environment configuration...")
-
+        
         span.set_attribute("check.type", "environment")
-
+        
         required_vars = ["OPENAI_API_KEY"]
         missing_vars = []
 
@@ -191,7 +191,7 @@ def check_environment():
 
         span.set_attribute("required_vars.count", len(required_vars))
         span.set_attribute("missing_vars.count", len(missing_vars))
-
+        
         if missing_vars:
             span.set_attribute("environment.status", "invalid")
             span.add_event("Missing environment variables", {
@@ -219,19 +219,19 @@ def check_qdrant():
     """Check if Qdrant is accessible"""
     with tracer.start_as_current_span("check_qdrant") as span:
         logger.info("🔍 Checking Qdrant connection...")
-
+        
         span.set_attribute("check.type", "qdrant")
         qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
         span.set_attribute("qdrant.url", qdrant_url)
 
         try:
             import requests
-
+            
             with tracer.start_as_current_span("qdrant_health_check") as health_span:
                 response = requests.get(qdrant_url, timeout=5)
                 health_span.set_attribute("http.status_code", response.status_code)
                 health_span.set_attribute("http.url", qdrant_url)
-
+                
                 if response.status_code == 200:
                     span.set_attribute("qdrant.status", "accessible")
                     span.add_event("Qdrant connection successful")
@@ -244,7 +244,7 @@ def check_qdrant():
                     })
                     logger.warning(f"⚠️  Qdrant responded with status {response.status_code}")
                     return False
-
+                    
         except Exception as e:
             span.set_attribute("qdrant.status", "unreachable")
             span.record_exception(e)
@@ -259,11 +259,11 @@ def start_backend_service():
     """Start the backend document processing service"""
     with tracer.start_as_current_span("start_backend_service") as span:
         logger.info("🚀 Starting backend document processing service...")
-
+        
         span.set_attribute("service.name", "backend_service")
         span.set_attribute("service.port", 8001)
         span.set_attribute("service.host", "0.0.0.0")
-
+        
         service_startup_counter.add(1, {"service": "backend", "status": "attempt"})
 
         try:
@@ -273,35 +273,24 @@ def start_backend_service():
                 "OTEL_SERVICE_NAME": "document-rag-backend",
                 "OTEL_RESOURCE_ATTRIBUTES": f"service.name=document-rag-backend,service.version=1.0.0",
                 "OTEL_EXPORTER_OTLP_ENDPOINT": os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317"),
-                "OTEL_EXPORTER_OTLP_INSECURE": "true",
-                "OTEL_PYTHON_LOG_CORRELATION": "true",
-                "OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED": "true",
-                "OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_SERVER_REQUEST": ".*",
-                "OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_SERVER_RESPONSE": ".*",
             })
-
+            
             # Inject trace context into environment for manual propagation
             from opentelemetry.propagate import inject
             headers = {}
             inject(headers)
             for key, value in headers.items():
                 env[f"OTEL_PROPAGATED_{key.upper().replace('-', '_')}"] = value
-
+            
             with tracer.start_as_current_span("subprocess_start") as subprocess_span:
-                # Use opentelemetry-instrument to auto-instrument the subprocess
                 process = subprocess.Popen([
-                    "opentelemetry-instrument",
-                    "--traces_exporter", "otlp",
-                    "--metrics_exporter", "otlp", 
-                    "--logs_exporter", "otlp",
                     sys.executable, "backend_service.py",
                     "--host", "0.0.0.0",
                     "--port", "8001"
                 ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-
+                
                 subprocess_span.set_attribute("subprocess.pid", process.pid)
-                subprocess_span.set_attribute("subprocess.command", "opentelemetry-instrument backend_service.py")
-                subprocess_span.set_attribute("instrumentation.type", "auto")
+                subprocess_span.set_attribute("subprocess.command", "backend_service.py")
 
             # Wait a bit to see if it starts successfully
             time.sleep(3)
@@ -332,10 +321,10 @@ def start_api_ui_server():
     """Start the API+UI server"""
     with tracer.start_as_current_span("start_api_ui_server") as span:
         logger.info("🌐 Starting API+UI server...")
-
+        
         span.set_attribute("service.name", "api_ui_server")
         span.set_attribute("service.port", 8000)
-
+        
         service_startup_counter.add(1, {"service": "api_ui", "status": "attempt"})
 
         try:
@@ -345,33 +334,22 @@ def start_api_ui_server():
                 "OTEL_SERVICE_NAME": "document-rag-api-ui",
                 "OTEL_RESOURCE_ATTRIBUTES": f"service.name=document-rag-api-ui,service.version=1.0.0",
                 "OTEL_EXPORTER_OTLP_ENDPOINT": os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317"),
-                "OTEL_EXPORTER_OTLP_INSECURE": "true",
-                "OTEL_PYTHON_LOG_CORRELATION": "true",
-                "OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED": "true",
-                "OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_SERVER_REQUEST": ".*",
-                "OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_SERVER_RESPONSE": ".*",
             })
-
+            
             # Inject trace context into environment for manual propagation
             from opentelemetry.propagate import inject
             headers = {}
             inject(headers)
             for key, value in headers.items():
                 env[f"OTEL_PROPAGATED_{key.upper().replace('-', '_')}"] = value
-
+            
             with tracer.start_as_current_span("subprocess_start") as subprocess_span:
-                # Use opentelemetry-instrument to auto-instrument the subprocess
                 process = subprocess.Popen([
-                    "opentelemetry-instrument",
-                    "--traces_exporter", "otlp",
-                    "--metrics_exporter", "otlp",
-                    "--logs_exporter", "otlp", 
                     sys.executable, "start_server.py"
                 ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-
+                
                 subprocess_span.set_attribute("subprocess.pid", process.pid)
-                subprocess_span.set_attribute("subprocess.command", "opentelemetry-instrument start_server.py")
-                subprocess_span.set_attribute("instrumentation.type", "auto")
+                subprocess_span.set_attribute("subprocess.command", "start_server.py")
 
             # Wait a bit to see if it starts successfully
             time.sleep(3)
@@ -403,10 +381,10 @@ def monitor_process(process, name):
     with tracer.start_as_current_span(f"monitor_process_{name.lower()}") as span:
         span.set_attribute("process.name", name)
         span.set_attribute("process.pid", process.pid)
-
+        
         process_monitoring_gauge.add(1, {"process": name.lower()})
         logger.info(f"🔍 Starting process monitor for {name}")
-
+        
         try:
             for line in iter(process.stdout.readline, ''):
                 if line:
@@ -415,7 +393,7 @@ def monitor_process(process, name):
                         log_span.set_attribute("log.source", name)
                         log_span.set_attribute("log.content", line.rstrip()[:200])  # Truncate long logs
                         logger.info(f"[{name}] {line.rstrip()}")
-
+                        
         except Exception as e:
             span.record_exception(e)
             logger.error(f"❌ Error monitoring {name}: {e}")
@@ -429,11 +407,11 @@ def main():
     current_span = trace.get_current_span()
     current_span.set_attribute("system.name", "document-rag-system")
     current_span.set_attribute("startup.version", "1.0.0")
-
+    
     # Add baggage for cross-service correlation
     baggage.set_baggage("system.component", "orchestrator")
     baggage.set_baggage("startup.session", str(uuid.uuid4()))
-
+    
     logger.info("🎯 Starting Complete Document RAG System")
     logger.info("=" * 60)
 
@@ -485,7 +463,7 @@ def main():
 
     current_span.set_attribute("startup.status", "completed")
     current_span.add_event("All services started successfully")
-
+    
     logger.info("")
     logger.info("✅ All services started successfully!")
     logger.info("")
@@ -513,11 +491,11 @@ def main():
         with tracer.start_as_current_span("system_shutdown") as shutdown_span:
             shutdown_span.set_attribute("shutdown.signal", signum)
             logger.info("\n🛑 Shutting down all services...")
-
+            
             # Update service health metrics
             service_health_gauge.add(-1, {"service": "backend"})
             service_health_gauge.add(-1, {"service": "api_ui"})
-
+            
             backend_process.terminate()
             api_process.terminate()
 
@@ -556,14 +534,14 @@ def main():
 
         backend_thread.start()
         api_thread.start()
-
+        
         monitor_span.set_attribute("monitoring.threads", 2)
         monitor_span.add_event("Process monitoring threads started")
 
     # Keep main thread alive with health monitoring
     with tracer.start_as_current_span("system_monitoring") as monitoring_span:
         monitoring_span.set_attribute("monitoring.type", "main_loop")
-
+        
         try:
             while True:
                 # Check if processes are still running
