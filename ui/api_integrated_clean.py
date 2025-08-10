@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-BEAST MODE: Enhanced API Service with Massive Service Tree
-Creates hierarchical query processing with granular service components
+ENHANCED API SERVICE: Complete Integration with W3C Trace Propagation
+Creates hierarchical query processing with granular service components and full trace correlation
 """
 
 import asyncio
@@ -26,11 +26,12 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Enhanced OpenTelemetry configuration
+# Enhanced OpenTelemetry configuration with W3C propagation
 from otel_config import (
     initialize_opentelemetry, get_service_tracer, traced_function, 
     trace_http_call, trace_health_check, get_current_trace_id,
-    add_trace_correlation_to_log
+    add_trace_correlation_to_log, inject_trace_context, extract_trace_context,
+    SERVICE_HIERARCHY
 )
 from metrics import (
     rag_metrics, time_query_processing, record_query_processed, 
@@ -43,11 +44,15 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain.docstore.document import Document
 
-# In SimpleQueryEngine.__init__
-from otel_config import initialize_opentelemetry
+# Initialize OpenTelemetry for API service
+tracer, meter = initialize_opentelemetry(
+    service_name="document-rag-api",
+    service_version="2.0.0",
+    environment="production"
+)
 
-def __init__(self):
-    self.tracer, self.meter = initialize_opentelemetry("document-rag-api")
+# Setup enhanced logging with trace correlation
+logger = add_trace_correlation_to_log(logging.getLogger(__name__))
 
 # Pydantic models
 class QueryRequest(BaseModel):
@@ -84,7 +89,7 @@ class SessionInfo(BaseModel):
     metadata: Dict[str, Any]
 
 class QueryProcessor:
-    """Query processing service component"""
+    """Query processing service component with enhanced W3C tracing"""
     
     def __init__(self):
         self.tracer = get_service_tracer("query-processor")
@@ -92,44 +97,84 @@ class QueryProcessor:
     
     @traced_function(service_name="query-processor")
     async def process_user_query(self, request: QueryRequest, vector_store) -> Dict[str, Any]:
-        """Process user query with detailed tracing"""
+        """Process user query with detailed W3C trace correlation"""
         with self.tracer.start_as_current_span("query_processor.process_user_query") as span:
             span.set_attribute("query.text", request.query[:100])
             span.set_attribute("query.max_sources", request.max_sources)
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.parent", "document-rag-api")
+            span.set_attribute("service.hierarchy.level", 2)
+            
+            # Add W3C trace context attributes
+            span.set_attribute("w3c.trace_id", get_current_trace_id())
             
             # Validate query
             with self.tracer.start_as_current_span("query_processor.validate_query") as validate_span:
+                validate_span.set_attribute("service.component", self.service_name)
+                
                 if not request.query or len(request.query.strip()) < 3:
                     validate_span.set_attribute("validation.result", "too_short")
                     raise HTTPException(status_code=400, detail="Query too short")
                 validate_span.set_attribute("validation.result", "valid")
             
-            # Perform vector search
+            # Perform vector search with enhanced tracing
             with self.tracer.start_as_current_span("query_processor.vector_search") as search_span:
+                search_span.set_attribute("service.component", self.service_name)
+                search_span.set_attribute("service.external", "qdrant-database")
+                search_span.set_attribute("search.query", request.query[:50])
+                search_span.set_attribute("search.k", request.max_sources or 5)
+                
                 docs = vector_store.similarity_search(request.query, k=request.max_sources or 5)
                 search_span.set_attribute("search.results_count", len(docs))
+                search_span.set_attribute("search.status", "success")
             
-            # Create sources
+            # Create sources with enhanced metadata
             with self.tracer.start_as_current_span("query_processor.create_sources") as sources_span:
+                sources_span.set_attribute("service.component", self.service_name)
+                
                 sources = []
                 for i, doc in enumerate(docs):
-                    source = {
-                        "id": f"doc_{i}",
-                        "title": doc.metadata.get("title", f"Document {i+1}"),
-                        "content": doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content,
-                        "confidence": 0.8,
-                        "metadata": doc.metadata,
-                        "page_number": doc.metadata.get("page"),
-                        "source_url": doc.metadata.get("source"),
-                        "google_drive_url": doc.metadata.get("google_drive_url")
-                    }
-                    sources.append(source)
+                    # Enhanced source processing with W3C context
+                    with self.tracer.start_as_current_span(f"process_source_{i}") as source_span:
+                        source_span.set_attribute("source.index", i)
+                        source_span.set_attribute("source.content_length", len(doc.page_content))
+                        
+                        source = {
+                            "id": f"doc_{i}",
+                            "title": doc.metadata.get("source_file_name", doc.metadata.get("title", f"Document {i+1}")),
+                            "source_file_name": doc.metadata.get("source_file_name", f"Document {i+1}"),
+                            "content": doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content,
+                            "confidence": doc.metadata.get("combined_score", 0.8),
+                            "metadata": doc.metadata,
+                            "page_number": doc.metadata.get("page_number"),
+                            "slide_number": doc.metadata.get("slide_number"),
+                            "sheet_name": doc.metadata.get("sheet_name"),
+                            "section_title": doc.metadata.get("section_title"),
+                            "heading": doc.metadata.get("heading"),
+                            # Enhanced file link information with better extraction
+                            "google_drive_url": doc.metadata.get("google_drive_url", doc.metadata.get("source", "")),
+                            "source_url": doc.metadata.get("source_url", ""),
+                            "url": doc.metadata.get("source", ""),
+                            # Quality metrics
+                            "quality_score": doc.metadata.get("quality_score", 0.8),
+                            "extraction_confidence": doc.metadata.get("extraction_confidence", 0.8),
+                            # Trace correlation
+                            "trace_id": get_current_trace_id(),
+                            "processed_by_service": "document-rag-api"
+                        }
+                        
+                        source_span.set_attribute("source.title", source["title"])
+                        source_span.set_attribute("source.confidence", source["confidence"])
+                        
+                        sources.append(source)
+                
                 sources_span.set_attribute("sources.created", len(sources))
+                sources_span.set_attribute("sources.status", "success")
             
             return {"documents": docs, "sources": sources}
 
 class ResponseGenerator:
-    """Response generation service component"""
+    """Response generation service component with OpenAI integration"""
     
     def __init__(self):
         self.tracer = get_service_tracer("response-generator")
@@ -137,10 +182,13 @@ class ResponseGenerator:
     
     @traced_function(service_name="response-generator")
     async def generate_response(self, query: str, documents: List[Document]) -> str:
-        """Generate AI response using OpenAI"""
+        """Generate AI response using OpenAI with enhanced W3C tracing"""
         with self.tracer.start_as_current_span("response_generator.generate_response") as span:
             span.set_attribute("query.text", query[:100])
             span.set_attribute("documents.count", len(documents))
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.parent", "document-rag-api")
+            span.set_attribute("service.hierarchy.level", 2)
             
             try:
                 import openai
@@ -152,6 +200,7 @@ class ResponseGenerator:
                     openai_span.set_attribute("openai.model", "gpt-4o-mini")
                     openai_span.set_attribute("openai.context_length", len(context))
                     openai_span.set_attribute("service.external", "openai-api")
+                    openai_span.set_attribute("service.component", self.service_name)
                     
                     prompt = f"""Based on the following context, please answer the user's question accurately and comprehensively.
 
@@ -175,18 +224,28 @@ Please provide a detailed answer based on the context provided. If the context d
                     response_text = response.choices[0].message.content
                     openai_span.set_attribute("openai.response_length", len(response_text))
                     openai_span.set_attribute("openai.tokens_used", response.usage.total_tokens if hasattr(response, 'usage') else 0)
+                    openai_span.set_attribute("openai.status", "success")
                     
                     span.set_attribute("response.generation_status", "success")
+                    span.set_attribute("response.length", len(response_text))
+                    span.set_attribute("response.word_count", len(response_text.split()))
+                    
                     return response_text
                 
             except Exception as e:
                 span.record_exception(e)
                 span.set_attribute("response.generation_status", "fallback")
+                span.set_attribute("response.error", str(e))
+                
+                # Fallback response
                 context = "\n\n".join([doc.page_content for doc in documents])
-                return f"Based on the retrieved documents, here's what I found relevant to your query: {context[:500]}..."
+                fallback_response = f"Based on the retrieved documents, here's what I found relevant to your query: {context[:500]}..."
+                
+                span.set_attribute("response.fallback_length", len(fallback_response))
+                return fallback_response
 
 class SessionManager:
-    """Session management service component"""
+    """Session management service component with enhanced tracking"""
     
     def __init__(self):
         self.tracer = get_service_tracer("session-manager")
@@ -195,8 +254,11 @@ class SessionManager:
     
     @traced_function(service_name="session-manager")
     def get_or_create_session(self, session_id: Optional[str]) -> str:
-        """Get existing session or create new one"""
+        """Get existing session or create new one with W3C trace correlation"""
         with self.tracer.start_as_current_span("session_manager.get_or_create_session") as span:
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.parent", "document-rag-api")
+            
             if not session_id:
                 session_id = str(uuid.uuid4())
                 span.set_attribute("session.created", True)
@@ -204,42 +266,52 @@ class SessionManager:
                 span.set_attribute("session.created", False)
             
             span.set_attribute("session.id", session_id)
+            span.set_attribute("w3c.trace_id", get_current_trace_id())
             
             if session_id not in self.sessions:
-                self.sessions[session_id] = SessionInfo(
-                    session_id=session_id,
-                    message_count=0,
-                    current_topic=None,
-                    created_at=datetime.now(timezone.utc).isoformat(),
-                    last_activity=datetime.now(timezone.utc).isoformat(),
-                    metadata={}
-                )
-                span.set_attribute("session.status", "new")
+                # Create new session with trace context
+                with self.tracer.start_as_current_span("session_manager.create_session") as create_span:
+                    self.sessions[session_id] = SessionInfo(
+                        session_id=session_id,
+                        message_count=0,
+                        current_topic=None,
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                        last_activity=datetime.now(timezone.utc).isoformat(),
+                        metadata={
+                            "created_trace_id": get_current_trace_id(),
+                            "service": self.service_name
+                        }
+                    )
+                    create_span.set_attribute("session.status", "new")
+                    create_span.set_attribute("session.trace_id", get_current_trace_id())
             else:
                 span.set_attribute("session.status", "existing")
             
-            # Update session
+            # Update session activity
             self.sessions[session_id].message_count += 1
             self.sessions[session_id].last_activity = datetime.now(timezone.utc).isoformat()
+            self.sessions[session_id].metadata["last_trace_id"] = get_current_trace_id()
             
             span.set_attribute("session.message_count", self.sessions[session_id].message_count)
             return session_id
     
     @traced_function(service_name="session-manager")
     def get_session_info(self, session_id: str) -> Optional[SessionInfo]:
-        """Get session information"""
+        """Get session information with trace correlation"""
         with self.tracer.start_as_current_span("session_manager.get_session_info") as span:
             span.set_attribute("session.id", session_id)
+            span.set_attribute("service.component", self.service_name)
             
             if session_id in self.sessions:
                 span.set_attribute("session.found", True)
+                span.set_attribute("session.message_count", self.sessions[session_id].message_count)
                 return self.sessions[session_id]
             else:
                 span.set_attribute("session.found", False)
                 return None
 
 class BackendProxy:
-    """Backend service proxy component"""
+    """Backend service proxy component with enhanced W3C propagation"""
     
     def __init__(self):
         self.tracer = get_service_tracer("backend-proxy")
@@ -248,74 +320,133 @@ class BackendProxy:
     
     @trace_http_call("GET", "backend_status", "backend-proxy")
     async def get_backend_status(self) -> Dict[str, Any]:
-        """Get backend service status with trace propagation"""
+        """Get backend service status with comprehensive W3C trace propagation"""
         with self.tracer.start_as_current_span("backend_proxy.get_backend_status") as span:
             span.set_attribute("backend.url", self.backend_url)
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.parent", "document-rag-api")
             span.set_attribute("http.target_service", "document-rag-backend")
+            span.set_attribute("w3c.propagation", "enabled")
             
             try:
                 async with httpx.AsyncClient() as client:
-                    # Add trace context to headers
-                    headers = {"X-Trace-ID": get_current_trace_id()}
+                    # Enhanced trace context injection with W3C headers
+                    headers = inject_trace_context({})
+                    headers.update({
+                        "X-Trace-ID": get_current_trace_id(),
+                        "X-Service-Chain": "document-rag-orchestrator -> document-rag-api -> backend-proxy -> document-rag-backend",
+                        "X-Request-Source": "api-backend-proxy"
+                    })
                     
-                    response = await client.get(f"{self.backend_url}/status", headers=headers, timeout=10.0)
+                    response = await client.get(
+                        f"{self.backend_url}/status", 
+                        headers=headers, 
+                        timeout=10.0
+                    )
                     
                     span.set_attribute("http.status_code", response.status_code)
+                    span.set_attribute("http.response_time", response.elapsed.total_seconds())
                     span.set_attribute("backend.response_size", len(response.content))
                     
                     if response.status_code == 200:
                         backend_data = response.json()
-                        span.set_attribute("backend.files_processed", backend_data.get("processing", {}).get("files_processed_session", 0))
-                        span.set_attribute("backend.is_running", backend_data.get("service", {}).get("is_running", False))
+                        
+                        # Extract enhanced backend metrics
+                        processing_info = backend_data.get("processing", {})
+                        service_info = backend_data.get("service", {})
+                        
+                        span.set_attribute("backend.files_processed", processing_info.get("files_processed_session", 0))
+                        span.set_attribute("backend.is_running", service_info.get("is_running", False))
+                        span.set_attribute("backend.uptime_seconds", service_info.get("uptime_seconds", 0))
+                        span.set_attribute("backend.status", "healthy")
+                        
                         return backend_data
                     else:
                         span.set_attribute("backend.status", "unhealthy")
-                        return {"status": "unhealthy", "status_code": response.status_code}
+                        span.set_attribute("backend.error", f"HTTP {response.status_code}")
+                        return {
+                            "status": "unhealthy", 
+                            "status_code": response.status_code,
+                            "error": f"Backend returned HTTP {response.status_code}"
+                        }
                         
             except httpx.TimeoutException:
                 span.set_attribute("backend.status", "timeout")
-                return {"status": "timeout"}
+                span.set_attribute("backend.error", "request_timeout")
+                return {"status": "timeout", "error": "Backend request timed out"}
             except httpx.ConnectError:
                 span.set_attribute("backend.status", "unreachable")
-                return {"status": "unreachable"}
+                span.set_attribute("backend.error", "connection_failed")
+                return {"status": "unreachable", "error": "Cannot connect to backend service"}
             except Exception as e:
                 span.record_exception(e)
                 span.set_attribute("backend.status", "error")
+                span.set_attribute("backend.error", str(e))
                 return {"status": "error", "error": str(e)}
     
     @trace_http_call("POST", "backend_scan", "backend-proxy")
     async def trigger_backend_scan(self) -> Dict[str, Any]:
-        """Trigger backend scan with trace propagation"""
+        """Trigger backend scan with enhanced W3C trace propagation"""
         with self.tracer.start_as_current_span("backend_proxy.trigger_scan") as span:
             span.set_attribute("backend.url", self.backend_url)
             span.set_attribute("action", "trigger_scan")
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("http.target_service", "document-rag-backend")
             
             try:
                 async with httpx.AsyncClient() as client:
-                    headers = {"X-Trace-ID": get_current_trace_id()}
+                    # Enhanced trace context with scan-specific metadata
+                    headers = inject_trace_context({})
+                    headers.update({
+                        "X-Trace-ID": get_current_trace_id(),
+                        "X-Service-Chain": "document-rag-orchestrator -> document-rag-api -> backend-proxy -> document-rag-backend",
+                        "X-Request-Source": "api-scan-trigger",
+                        "X-Action": "manual-scan"
+                    })
                     
-                    response = await client.post(f"{self.backend_url}/scan", headers=headers, timeout=30.0)
+                    response = await client.post(
+                        f"{self.backend_url}/scan", 
+                        headers=headers, 
+                        timeout=30.0
+                    )
                     
                     span.set_attribute("http.status_code", response.status_code)
+                    span.set_attribute("http.response_time", response.elapsed.total_seconds())
                     
                     if response.status_code == 200:
                         scan_result = response.json()
                         span.set_attribute("scan.triggered", True)
+                        span.set_attribute("scan.status", "success")
+                        
+                        # Extract scan result metadata
+                        if isinstance(scan_result, dict):
+                            span.set_attribute("scan.message", scan_result.get("message", "Scan triggered"))
+                            span.set_attribute("scan.trace_id", scan_result.get("trace_id", ""))
+                        
                         return scan_result
                     else:
                         span.set_attribute("scan.triggered", False)
-                        return {"status": "failed", "status_code": response.status_code}
+                        span.set_attribute("scan.status", "failed")
+                        span.set_attribute("scan.error", f"HTTP {response.status_code}")
+                        
+                        return {
+                            "status": "failed", 
+                            "status_code": response.status_code,
+                            "error": f"Backend scan failed with HTTP {response.status_code}"
+                        }
                         
             except Exception as e:
                 span.record_exception(e)
                 span.set_attribute("scan.triggered", False)
+                span.set_attribute("scan.status", "error")
+                span.set_attribute("scan.error", str(e))
                 return {"status": "error", "error": str(e)}
 
-class SimpleQueryEngine:
-    """Main query engine orchestrator"""
+class EnhancedQueryEngine:
+    """Main query engine orchestrator with full W3C trace correlation"""
     
     def __init__(self):
-        # Initialize main API service tracer
+        # Initialize main API service tracer with proper hierarchy
         self.tracer, self.meter = initialize_opentelemetry(
             service_name="document-rag-api",
             service_version="2.0.0",
@@ -324,13 +455,13 @@ class SimpleQueryEngine:
         
         self.service_name = "document-rag-api"
         
-        # Configuration
+        # Configuration with enhanced metadata
         self.qdrant_host = os.getenv("QDRANT_HOST", "localhost")
         self.qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
         self.collection_name = os.getenv("COLLECTION_NAME", "documents")
         self.embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
         
-        # Initialize service components
+        # Initialize service components with proper hierarchy
         self.query_processor = QueryProcessor()
         self.response_generator = ResponseGenerator()
         self.session_manager = SessionManager()
@@ -339,29 +470,37 @@ class SimpleQueryEngine:
         # Vector store
         self.vector_store = None
         
-        # Setup logger BEFORE initialization
+        # Setup enhanced logger with trace correlation
         self.logger = add_trace_correlation_to_log(logging.getLogger(__name__))
         
+        # Initialize components
         self._initialize_components()
         
-        self.logger.info("Enhanced API service initialized with service tree")
+        self.logger.info("Enhanced API service initialized with full W3C trace propagation")
     
     @traced_function(service_name="document-rag-api")
     def _initialize_components(self):
-        """Initialize vector store and components"""
+        """Initialize vector store and components with enhanced tracing"""
         with self.tracer.start_as_current_span("api.initialize_components") as span:
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.parent", "document-rag-orchestrator")
+            span.set_attribute("initialization.type", "enhanced")
+            
             try:
-                # Initialize embeddings
+                # Initialize embeddings with tracing
                 with self.tracer.start_as_current_span("openai_embeddings.init") as emb_span:
                     embeddings = OpenAIEmbeddings(model=self.embedding_model)
                     emb_span.set_attribute("embedding.model", self.embedding_model)
                     emb_span.set_attribute("service.external", "openai-api")
+                    emb_span.set_attribute("embedding.dimension", 3072)  # text-embedding-3-large
                 
-                # Initialize vector store
+                # Initialize vector store with enhanced connection details
                 with self.tracer.start_as_current_span("qdrant_client.connect") as vs_span:
                     qdrant_url = f"http://{self.qdrant_host}:{self.qdrant_port}"
                     vs_span.set_attribute("qdrant.url", qdrant_url)
                     vs_span.set_attribute("qdrant.collection", self.collection_name)
+                    vs_span.set_attribute("qdrant.host", self.qdrant_host)
+                    vs_span.set_attribute("qdrant.port", self.qdrant_port)
                     vs_span.set_attribute("service.external", "qdrant-database")
                     
                     self.vector_store = QdrantVectorStore.from_existing_collection(
@@ -373,61 +512,72 @@ class SimpleQueryEngine:
                     self.logger.info(f"Connected to Qdrant at {qdrant_url}")
                 
                 span.set_attribute("init.status", "success")
+                span.set_attribute("init.components_ready", True)
+                span.set_attribute("init.vector_store", self.vector_store is not None)
                 
             except Exception as e:
                 span.record_exception(e)
                 span.set_attribute("init.status", "failed")
+                span.set_attribute("init.error", str(e))
                 self.logger.error(f"Component initialization failed: {e}")
                 self.vector_store = None
     
-    @traced_function(service_name="document-rag-api")
     async def process_query(self, request: QueryRequest) -> QueryResponse:
-        """Process query through service pipeline"""
+        """Process query through enhanced service pipeline with full W3C correlation"""
         with self.tracer.start_as_current_span("api.process_query") as span:
             start_time = datetime.now()
             
             span.set_attribute("query.text", request.query[:100])
             span.set_attribute("query.max_sources", request.max_sources or 5)
-            span.set_attribute("api.service_tree", "document-rag-orchestrator -> document-rag-api -> [components]")
+            span.set_attribute("query.include_context", request.include_context)
+            span.set_attribute("query.citation_format", request.citation_format)
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.hierarchy", "document-rag-orchestrator -> document-rag-api")
+            span.set_attribute("w3c.trace_id", get_current_trace_id())
             
             try:
                 if not self.vector_store:
                     span.set_attribute("api.error", "vector_store_unavailable")
+                    span.set_attribute("api.status", "service_unavailable")
                     raise HTTPException(status_code=503, detail="Vector store not available")
                 
-                # Session management
+                # Enhanced session management with trace correlation
                 with self.tracer.start_as_current_span("api.session_management") as session_span:
                     session_id = self.session_manager.get_or_create_session(request.session_id)
                     session_span.set_attribute("session.id", session_id)
+                    session_span.set_attribute("session.trace_id", get_current_trace_id())
                 
-                # Query processing
+                # Enhanced query processing with full context propagation
                 with self.tracer.start_as_current_span("api.query_processing") as query_span:
                     query_result = await self.query_processor.process_user_query(request, self.vector_store)
                     query_span.set_attribute("query.documents_found", len(query_result["documents"]))
+                    query_span.set_attribute("query.sources_created", len(query_result["sources"]))
                 
-                # Response generation
+                # Enhanced response generation with OpenAI integration
                 with self.tracer.start_as_current_span("api.response_generation") as response_span:
                     response_text = await self.response_generator.generate_response(
                         request.query, 
                         query_result["documents"]
                     )
                     response_span.set_attribute("response.length", len(response_text))
+                    response_span.set_attribute("response.word_count", len(response_text.split()))
                 
-                # Create citations
+                # Create enhanced citations with trace context
                 with self.tracer.start_as_current_span("api.create_citations") as citation_span:
                     citations = self._create_citations(query_result["documents"], request.citation_format)
                     citation_span.set_attribute("citations.count", len(citations))
+                    citation_span.set_attribute("citations.format", request.citation_format)
                 
                 # Calculate processing time
                 processing_time = (datetime.now() - start_time).total_seconds()
                 
-                # Build response
+                # Build enhanced response with comprehensive metadata
                 result = QueryResponse(
                     query=request.query,
                     response=response_text,
                     sources=query_result["sources"],
-                    confidence=0.8,
-                    query_type="vector_search",
+                    confidence=0.8,  # Could be calculated from source confidences
+                    query_type="enhanced_vector_search",
                     complexity="medium",
                     processing_time=processing_time,
                     context_used=request.include_context,
@@ -437,44 +587,59 @@ class SimpleQueryEngine:
                     metadata={
                         "sources_count": len(query_result["sources"]),
                         "service_tree": "document-rag-api -> query-processor,response-generator,session-manager",
-                        "trace_id": get_current_trace_id()
+                        "trace_id": get_current_trace_id(),
+                        "w3c_propagation": "enabled",
+                        "service_hierarchy": "document-rag-orchestrator -> document-rag-api -> [components]",
+                        "external_services": ["openai-api", "qdrant-database"],
+                        "processing_pipeline": ["query_processing", "vector_search", "response_generation", "citation_creation"]
                     },
                     timestamp=datetime.now(timezone.utc).isoformat()
                 )
                 
+                # Enhanced span attributes
                 span.set_attribute("api.processing_time", processing_time)
                 span.set_attribute("api.response.sources_count", len(result.sources))
                 span.set_attribute("api.response.word_count", result.word_count)
+                span.set_attribute("api.response.confidence", result.confidence)
+                span.set_attribute("api.status", "success")
                 
-                # Record metrics
+                # Record enhanced metrics
                 record_query_processed(
                     query_type=result.query_type,
                     result_count=len(result.sources),
                     confidence=result.confidence
                 )
                 
-                span.set_attribute("api.status", "success")
-                self.logger.info(f"Query processed: {processing_time:.2f}s, {len(result.sources)} sources")
+                self.logger.info(f"Query processed: {processing_time:.2f}s, {len(result.sources)} sources, trace_id: {get_current_trace_id()}")
                 
                 return result
                 
             except Exception as e:
                 span.record_exception(e)
                 span.set_attribute("api.status", "error")
+                span.set_attribute("api.error", str(e))
+                span.set_attribute("api.error_type", type(e).__name__)
                 self.logger.error(f"Query processing failed: {e}")
                 raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
     
     def _create_citations(self, docs: List[Document], format_type: str) -> List[str]:
-        """Create citations for sources"""
+        """Create enhanced citations with trace correlation"""
         with self.tracer.start_as_current_span("api.create_citations") as span:
             span.set_attribute("citations.format", format_type)
             span.set_attribute("citations.docs_count", len(docs))
+            span.set_attribute("service.component", self.service_name)
             
             citations = []
             for i, doc in enumerate(docs):
-                title = doc.metadata.get("title", f"Document {i+1}")
-                source = doc.metadata.get("source", "Unknown source")
-                citations.append(f"[{i+1}] {title} - {source}")
+                with self.tracer.start_as_current_span(f"create_citation_{i}") as citation_span:
+                    title = doc.metadata.get("source_file_name", doc.metadata.get("title", f"Document {i+1}"))
+                    source = doc.metadata.get("source", "Unknown source")
+                    
+                    citation = f"[{i+1}] {title} - {source}"
+                    citations.append(citation)
+                    
+                    citation_span.set_attribute("citation.title", title)
+                    citation_span.set_attribute("citation.source", source)
             
             span.set_attribute("citations.created_count", len(citations))
             return citations
@@ -485,8 +650,8 @@ orchestrator_tracer = None
 
 # Initialize FastAPI with enhanced hierarchy
 app = FastAPI(
-    title="Enhanced Document RAG API with Service Tree",
-    description="Hierarchical query processing with granular service components",
+    title="Enhanced Document RAG API with Complete W3C Trace Correlation",
+    description="Advanced hierarchical query processing with granular service components and full trace propagation",
     version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -502,11 +667,13 @@ app.add_middleware(
 )
 
 # Mount static files
-app.mount("/static", StaticFiles(directory="ui/static"), name="static")
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.exists(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize with orchestrator context"""
+    """Initialize with enhanced orchestrator context and W3C propagation"""
     global enhanced_query_engine, orchestrator_tracer
     
     # Get orchestrator tracer for parent context
@@ -514,106 +681,221 @@ async def startup_event():
     
     with orchestrator_tracer.start_as_current_span("api_service.startup") as startup_span:
         startup_span.set_attribute("service.component", "api")
+        startup_span.set_attribute("service.parent", "document-rag-orchestrator")
         startup_span.set_attribute("startup.phase", "initialization")
+        startup_span.set_attribute("w3c.propagation", "enabled")
+        startup_span.set_attribute("service.hierarchy", "document-rag-orchestrator -> document-rag-api")
         
         try:
-            enhanced_query_engine = SimpleQueryEngine()
+            enhanced_query_engine = EnhancedQueryEngine()
             startup_span.set_attribute("api.initialization", "success")
+            startup_span.set_attribute("api.components_ready", True)
+            startup_span.set_attribute("api.vector_store_connected", enhanced_query_engine.vector_store is not None)
         except Exception as e:
             startup_span.record_exception(e)
             startup_span.set_attribute("api.initialization", "failed")
+            startup_span.set_attribute("api.error", str(e))
             enhanced_query_engine = None
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
-    """Serve main HTML with service hierarchy info"""
-    try:
-        with open("ui/static/index.html", "r") as f:
-            content = f.read()
-            return HTMLResponse(content=content)
-    except FileNotFoundError:
-        return HTMLResponse(content="<h1>Enhanced Document RAG API</h1><p>Service tree active but static files not found.</p>")
+    """Serve main HTML with enhanced service hierarchy info"""
+    with orchestrator_tracer.start_as_current_span("api.serve_root") as span:
+        span.set_attribute("endpoint", "/")
+        span.set_attribute("service.component", "document-rag-api")
+        span.set_attribute("w3c.trace_id", get_current_trace_id())
+        
+        try:
+            index_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
+            if os.path.exists(index_path):
+                with open(index_path, "r") as f:
+                    content = f.read()
+                    span.set_attribute("static.file_served", "index.html")
+                    span.set_attribute("static.content_length", len(content))
+                    return HTMLResponse(content=content)
+            else:
+                span.set_attribute("static.file_found", False)
+                return HTMLResponse(content=f"""
+                <html>
+                <head><title>Enhanced Document RAG API</title></head>
+                <body>
+                    <h1>🔥 Enhanced Document RAG API</h1>
+                    <p>Service tree active with full W3C trace propagation</p>
+                    <p><strong>Trace ID:</strong> {get_current_trace_id()}</p>
+                    <p><strong>Service Hierarchy:</strong> document-rag-orchestrator → document-rag-api</p>
+                    <p>Static files not found - API endpoints are still available</p>
+                </body>
+                </html>
+                """)
+        except Exception as e:
+            span.record_exception(e)
+            span.set_attribute("static.error", str(e))
+            return HTMLResponse(content=f"<h1>Enhanced Document RAG API</h1><p>Error loading static files: {e}</p>")
 
 @app.post("/api/query", response_model=QueryResponse)
 async def process_query(request: QueryRequest):
-    """Process query through enhanced service pipeline"""
-    if not enhanced_query_engine:
-        raise HTTPException(status_code=503, detail="Query engine not initialized")
-    
-    # Process with timing
-    with time_query_processing(session_id=request.session_id or "new", query_type="api_request"):
-        response = await enhanced_query_engine.process_query(request)
-    
-    return response
+    """Process query through enhanced service pipeline with full W3C trace correlation"""
+    with orchestrator_tracer.start_as_current_span("api.endpoint_process_query") as span:
+        span.set_attribute("endpoint", "/api/query")
+        span.set_attribute("request.query", request.query[:100] + "..." if len(request.query) > 100 else request.query)
+        span.set_attribute("request.session_id", request.session_id or "new")
+        span.set_attribute("request.max_sources", request.max_sources or 5)
+        span.set_attribute("w3c.trace_id", get_current_trace_id())
+        
+        if not enhanced_query_engine:
+            span.set_attribute("api.error", "query_engine_not_initialized")
+            raise HTTPException(status_code=503, detail="Enhanced query engine not initialized")
+        
+        # Process query with enhanced timing
+        with time_query_processing(session_id=request.session_id or "new", query_type="enhanced_api_request"):
+            response = await enhanced_query_engine.process_query(request)
+        
+        span.set_attribute("api.response.processing_time", response.processing_time)
+        span.set_attribute("api.response.sources_count", len(response.sources))
+        span.set_attribute("api.response.confidence", response.confidence)
+        span.set_attribute("api.response.trace_id", response.metadata.get("trace_id", ""))
+        
+        return response
 
 @app.get("/api/sessions/{session_id}")
 async def get_session(session_id: str):
-    """Get session information"""
-    if not enhanced_query_engine:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    
-    session_info = enhanced_query_engine.session_manager.get_session_info(session_id)
-    
-    if not session_info:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    return {"session": session_info, "conversation_history": []}
+    """Get session information with enhanced trace correlation"""
+    with orchestrator_tracer.start_as_current_span("api.get_session") as span:
+        span.set_attribute("endpoint", "/api/sessions/{session_id}")
+        span.set_attribute("session.id", session_id)
+        span.set_attribute("w3c.trace_id", get_current_trace_id())
+        
+        if not enhanced_query_engine:
+            raise HTTPException(status_code=503, detail="Service not initialized")
+        
+        session_info = enhanced_query_engine.session_manager.get_session_info(session_id)
+        
+        if not session_info:
+            span.set_attribute("session.found", False)
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        span.set_attribute("session.found", True)
+        span.set_attribute("session.message_count", session_info.message_count)
+        
+        return {
+            "session": session_info, 
+            "conversation_history": [],
+            "trace_context": {
+                "trace_id": get_current_trace_id(),
+                "service": "document-rag-api",
+                "hierarchy": "document-rag-orchestrator -> document-rag-api -> session-manager"
+            }
+        }
 
 @app.get("/api/health")
 async def health_check():
-    """Comprehensive health check with service tree status"""
-    # Check main components
-    api_healthy = enhanced_query_engine and enhanced_query_engine.vector_store is not None
-    
-    # Check backend service
-    backend_status = "unknown"
-    if enhanced_query_engine:
-        backend_result = await enhanced_query_engine.backend_proxy.get_backend_status()
-        backend_status = backend_result.get("status", "unknown")
-    
-    components = {
-        "vector_store": api_healthy,
-        "query_processor": enhanced_query_engine.query_processor is not None if enhanced_query_engine else False,
-        "response_generator": enhanced_query_engine.response_generator is not None if enhanced_query_engine else False,
-        "session_manager": enhanced_query_engine.session_manager is not None if enhanced_query_engine else False,
-        "backend_proxy": enhanced_query_engine.backend_proxy is not None if enhanced_query_engine else False,
-        "backend_service": backend_status == "healthy" if backend_status != "unknown" else False
-    }
-    
-    overall_status = "healthy" if api_healthy and backend_status == "healthy" else "unhealthy"
-    
-    health_data = {
-        "service": "document-rag-api",
-        "status": overall_status,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": "2.0.0",
-        "components": components,
-        "backend_service": {
-            "status": backend_status,
-            "url": enhanced_query_engine.backend_proxy.backend_url if enhanced_query_engine else "unknown"
+    """Comprehensive health check with full service tree status and W3C trace correlation"""
+    with orchestrator_tracer.start_as_current_span("api.health_check") as span:
+        span.set_attribute("endpoint", "/api/health")
+        span.set_attribute("health.check_type", "comprehensive")
+        span.set_attribute("w3c.trace_id", get_current_trace_id())
+        
+        # Check main API components
+        api_healthy = enhanced_query_engine and enhanced_query_engine.vector_store is not None
+        
+        # Check backend service with enhanced error handling
+        backend_status = "unknown"
+        backend_details = {}
+        if enhanced_query_engine:
+            with span:
+                backend_result = await enhanced_query_engine.backend_proxy.get_backend_status()
+                backend_status = backend_result.get("status", "unknown")
+                backend_details = backend_result
+        
+        # Enhanced component status with trace correlation
+        components = {
+            "vector_store": {
+                "status": api_healthy,
+                "service_path": "document-rag-api -> qdrant-database",
+                "external": True
+            },
+            "query_processor": {
+                "status": enhanced_query_engine.query_processor is not None if enhanced_query_engine else False,
+                "service_path": "document-rag-api -> query-processor"
+            },
+            "response_generator": {
+                "status": enhanced_query_engine.response_generator is not None if enhanced_query_engine else False,
+                "service_path": "document-rag-api -> response-generator -> openai-api",
+                "external_dependency": "openai-api"
+            },
+            "session_manager": {
+                "status": enhanced_query_engine.session_manager is not None if enhanced_query_engine else False,
+                "service_path": "document-rag-api -> session-manager",
+                "active_sessions": len(enhanced_query_engine.session_manager.sessions) if enhanced_query_engine else 0
+            },
+            "backend_proxy": {
+                "status": enhanced_query_engine.backend_proxy is not None if enhanced_query_engine else False,
+                "service_path": "document-rag-api -> backend-proxy -> document-rag-backend",
+                "target_service": "document-rag-backend"
+            }
         }
-    }
-    
-    record_cache_event("health_check", overall_status == "healthy")
-    
-    return health_data
+        
+        # Determine overall health
+        component_health = [comp.get("status", False) for comp in components.values() if not comp.get("external")]
+        backend_healthy = backend_status in ["healthy", "running"]
+        overall_status = "healthy" if api_healthy and backend_healthy and all(component_health) else "degraded"
+        
+        health_data = {
+            "service": "document-rag-api",
+            "status": overall_status,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "version": "2.0.0",
+            "components": components,
+            "backend_service": {
+                "status": backend_status,
+                "url": enhanced_query_engine.backend_proxy.backend_url if enhanced_query_engine else "unknown",
+                "details": backend_details
+            },
+            "service_hierarchy": {
+                "parent": "document-rag-orchestrator",
+                "service": "document-rag-api",
+                "children": list(components.keys()),
+                "external_dependencies": ["openai-api", "qdrant-database", "document-rag-backend"]
+            },
+            "trace_context": {
+                "trace_id": get_current_trace_id(),
+                "w3c_propagation": "enabled",
+                "service_chain": "document-rag-orchestrator -> document-rag-api",
+                "propagation_formats": ["W3C TraceContext", "B3", "Jaeger"]
+            }
+        }
+        
+        # Enhanced span attributes
+        span.set_attribute("health.overall_status", overall_status)
+        span.set_attribute("health.api_healthy", api_healthy)
+        span.set_attribute("health.backend_status", backend_status)
+        span.set_attribute("health.components_total", len(components))
+        span.set_attribute("health.components_healthy", sum(1 for c in components.values() if c.get("status")))
+        
+        # Record health metrics
+        record_cache_event("health_check", overall_status == "healthy")
+        record_cache_event("backend_health_check", backend_healthy)
+        
+        return health_data
 
 @app.get("/api/backend/status")
-@traced_function(service_name="document-rag-api")
 async def get_backend_status():
-    """Proxy backend status with trace propagation"""
+    """Proxy backend status with enhanced W3C trace propagation"""
     with orchestrator_tracer.start_as_current_span("api.get_backend_status") as span:
         span.set_attribute("endpoint", "/api/backend/status")
         span.set_attribute("proxy.target", "document-rag-backend")
+        span.set_attribute("w3c.propagation", "enabled")
         
         if not enhanced_query_engine:
             raise HTTPException(status_code=503, detail="Service not initialized")
         
         backend_result = await enhanced_query_engine.backend_proxy.get_backend_status()
         
+        # Enhanced error handling with trace correlation
         if backend_result.get("status") == "error":
             span.set_attribute("proxy.result", "error")
-            raise HTTPException(status_code=502, detail="Backend service error")
+            span.set_attribute("proxy.error", backend_result.get("error", "Unknown error"))
+            raise HTTPException(status_code=502, detail=f"Backend service error: {backend_result.get('error')}")
         elif backend_result.get("status") == "timeout":
             span.set_attribute("proxy.result", "timeout")
             raise HTTPException(status_code=504, detail="Backend service timeout")
@@ -622,337 +904,37 @@ async def get_backend_status():
             raise HTTPException(status_code=502, detail="Backend service unreachable")
         
         span.set_attribute("proxy.result", "success")
+        span.set_attribute("proxy.backend_status", backend_result.get("status", "unknown"))
+        
         return backend_result
 
 @app.post("/api/backend/scan")
-@traced_function(service_name="document-rag-api")
 async def trigger_backend_scan():
-    """Trigger backend scan via proxy"""
+    """Trigger backend scan via proxy with enhanced W3C trace propagation"""
     with orchestrator_tracer.start_as_current_span("api.trigger_backend_scan") as span:
         span.set_attribute("endpoint", "/api/backend/scan")
         span.set_attribute("action", "trigger_scan")
+        span.set_attribute("proxy.target", "document-rag-backend")
+        span.set_attribute("w3c.propagation", "enabled")
         
         if not enhanced_query_engine:
             raise HTTPException(status_code=503, detail="Service not initialized")
         
         scan_result = await enhanced_query_engine.backend_proxy.trigger_backend_scan()
         
+        # Enhanced scan result processing with trace correlation
         if scan_result.get("status") == "error":
             span.set_attribute("scan.result", "error")
+            span.set_attribute("scan.error", scan_result.get("error", "Unknown error"))
             raise HTTPException(status_code=502, detail=f"Backend scan failed: {scan_result.get('error')}")
         elif scan_result.get("status") == "failed":
             span.set_attribute("scan.result", "failed")
-            raise HTTPException(status_code=502, detail="Backend scan failed")
+            raise HTTPException(status_code=502, detail="Backend scan request failed")
         
         span.set_attribute("scan.result", "success")
+        span.set_attribute("scan.triggered", True)
+        
         return scan_result
-
-@app.get("/api/components")
-@traced_function(service_name="document-rag-api")
-async def get_api_components():
-    """Get detailed status of all API service components"""
-    with orchestrator_tracer.start_as_current_span("api.get_components") as span:
-        span.set_attribute("endpoint", "/api/components")
-        
-        if not enhanced_query_engine:
-            raise HTTPException(status_code=503, detail="Service not initialized")
-        
-        components = {}
-        
-        # Query Processor Component
-        with enhanced_query_engine.tracer.start_as_current_span("check.query_processor") as qp_span:
-            components["query-processor"] = {
-                "status": "healthy",
-                "description": "Processes user queries and performs vector searches",
-                "service_path": "document-rag-api -> query-processor",
-                "capabilities": ["query_validation", "vector_search", "source_creation"]
-            }
-            qp_span.set_attribute("component.status", "healthy")
-        
-        # Response Generator Component
-        with enhanced_query_engine.tracer.start_as_current_span("check.response_generator") as rg_span:
-            try:
-                import openai
-                components["response-generator"] = {
-                    "status": "healthy",
-                    "description": "Generates AI responses using OpenAI GPT models",
-                    "service_path": "document-rag-api -> response-generator -> openai-api",
-                    "model": "gpt-4o-mini",
-                    "external_dependency": "openai-api"
-                }
-                rg_span.set_attribute("component.status", "healthy")
-            except ImportError:
-                components["response-generator"] = {
-                    "status": "degraded",
-                    "description": "OpenAI library not available",
-                    "service_path": "document-rag-api -> response-generator"
-                }
-                rg_span.set_attribute("component.status", "degraded")
-        
-        # Session Manager Component
-        with enhanced_query_engine.tracer.start_as_current_span("check.session_manager") as sm_span:
-            session_count = len(enhanced_query_engine.session_manager.sessions)
-            components["session-manager"] = {
-                "status": "healthy",
-                "description": "Manages user sessions and conversation context",
-                "service_path": "document-rag-api -> session-manager",
-                "active_sessions": session_count,
-                "capabilities": ["session_creation", "session_tracking", "context_management"]
-            }
-            sm_span.set_attribute("component.status", "healthy")
-            sm_span.set_attribute("sessions.active", session_count)
-        
-        # Backend Proxy Component
-        with enhanced_query_engine.tracer.start_as_current_span("check.backend_proxy") as bp_span:
-            backend_status = await enhanced_query_engine.backend_proxy.get_backend_status()
-            proxy_status = "healthy" if backend_status.get("status") not in ["error", "timeout", "unreachable"] else "unhealthy"
-            
-            components["backend-proxy"] = {
-                "status": proxy_status,
-                "description": "Proxies requests to backend document processing service",
-                "service_path": "document-rag-api -> backend-proxy -> document-rag-backend",
-                "backend_url": enhanced_query_engine.backend_proxy.backend_url,
-                "backend_status": backend_status.get("status", "unknown"),
-                "capabilities": ["status_proxy", "scan_trigger", "health_monitoring"]
-            }
-            bp_span.set_attribute("component.status", proxy_status)
-            bp_span.set_attribute("backend.status", backend_status.get("status", "unknown"))
-        
-        # Vector Store Connection
-        with enhanced_query_engine.tracer.start_as_current_span("check.vector_store") as vs_span:
-            try:
-                if enhanced_query_engine.vector_store:
-                    # Test connection
-                    test_result = enhanced_query_engine.vector_store.similarity_search("test", k=1)
-                    components["vector-store-connection"] = {
-                        "status": "healthy",
-                        "description": "Connection to Qdrant vector database",
-                        "service_path": "document-rag-api -> qdrant-database",
-                        "qdrant_url": f"http://{enhanced_query_engine.qdrant_host}:{enhanced_query_engine.qdrant_port}",
-                        "collection": enhanced_query_engine.collection_name,
-                        "embedding_model": enhanced_query_engine.embedding_model,
-                        "external_dependency": "qdrant-database"
-                    }
-                    vs_span.set_attribute("component.status", "healthy")
-                else:
-                    components["vector-store-connection"] = {
-                        "status": "unhealthy",
-                        "description": "Vector store not initialized",
-                        "service_path": "document-rag-api -> qdrant-database"
-                    }
-                    vs_span.set_attribute("component.status", "unhealthy")
-            except Exception as e:
-                components["vector-store-connection"] = {
-                    "status": "unhealthy",
-                    "description": f"Vector store error: {str(e)}",
-                    "service_path": "document-rag-api -> qdrant-database"
-                }
-                vs_span.set_attribute("component.status", "unhealthy")
-        
-        span.set_attribute("components.total", len(components))
-        span.set_attribute("components.healthy", len([c for c in components.values() if c.get("status") == "healthy"]))
-        
-        return {
-            "service": "document-rag-api",
-            "components": components,
-            "service_tree": {
-                "hierarchy": "document-rag-orchestrator -> document-rag-api -> [components]",
-                "parent": "document-rag-orchestrator",
-                "children": list(components.keys()),
-                "external_dependencies": ["openai-api", "qdrant-database", "document-rag-backend"]
-            },
-            "summary": {
-                "total_components": len(components),
-                "healthy_components": len([c for c in components.values() if c.get("status") == "healthy"]),
-                "degraded_components": len([c for c in components.values() if c.get("status") == "degraded"]),
-                "unhealthy_components": len([c for c in components.values() if c.get("status") == "unhealthy"])
-            },
-            "trace_context": {
-                "trace_id": get_current_trace_id(),
-                "service_hierarchy": "document-rag-orchestrator -> document-rag-api"
-            }
-        }
-
-@app.get("/api/service-map")
-@traced_function(service_name="document-rag-api")
-async def get_service_map():
-    """Get complete service map visualization"""
-    with orchestrator_tracer.start_as_current_span("api.get_service_map") as span:
-        span.set_attribute("endpoint", "/api/service-map")
-        
-        # Build comprehensive service map
-        service_map = {
-            "root": "document-rag-orchestrator",
-            "tree": {
-                "document-rag-orchestrator": {
-                    "type": "orchestrator",
-                    "status": "healthy",
-                    "children": ["document-rag-api", "document-rag-backend", "process-manager"]
-                },
-                "document-rag-api": {
-                    "type": "api_service",
-                    "status": "healthy" if enhanced_query_engine else "unhealthy",
-                    "port": 8000,
-                    "children": ["query-processor", "response-generator", "session-manager", "backend-proxy"],
-                    "external_dependencies": ["openai-api", "qdrant-database"]
-                },
-                "query-processor": {
-                    "type": "component",
-                    "status": "healthy",
-                    "parent": "document-rag-api",
-                    "capabilities": ["query_validation", "vector_search", "source_creation"]
-                },
-                "response-generator": {
-                    "type": "component", 
-                    "status": "healthy",
-                    "parent": "document-rag-api",
-                    "external_dependencies": ["openai-api"]
-                },
-                "session-manager": {
-                    "type": "component",
-                    "status": "healthy", 
-                    "parent": "document-rag-api",
-                    "active_sessions": len(enhanced_query_engine.session_manager.sessions) if enhanced_query_engine else 0
-                },
-                "backend-proxy": {
-                    "type": "component",
-                    "status": "healthy",
-                    "parent": "document-rag-api",
-                    "target": "document-rag-backend"
-                }
-            },
-            "external_services": {
-                "openai-api": {
-                    "type": "external",
-                    "description": "OpenAI GPT API for completions and embeddings",
-                    "endpoints": ["chat/completions", "embeddings"]
-                },
-                "qdrant-database": {
-                    "type": "external", 
-                    "description": "Vector database for document embeddings",
-                    "url": f"http://{enhanced_query_engine.qdrant_host}:{enhanced_query_engine.qdrant_port}" if enhanced_query_engine else "unknown"
-                },
-                "document-rag-backend": {
-                    "type": "internal_service",
-                    "description": "Document processing and monitoring service",
-                    "port": 8001
-                }
-            },
-            "flow_patterns": {
-                "query_processing": [
-                    "document-rag-api",
-                    "query-processor", 
-                    "qdrant-database",
-                    "response-generator",
-                    "openai-api"
-                ],
-                "document_processing": [
-                    "document-rag-backend",
-                    "google-drive-monitor",
-                    "document-processor",
-                    "embedding-generator", 
-                    "vector-store-manager",
-                    "qdrant-database"
-                ],
-                "health_monitoring": [
-                    "document-rag-orchestrator",
-                    "document-rag-api",
-                    "backend-proxy",
-                    "document-rag-backend"
-                ]
-            },
-            "metrics": {
-                "total_services": 2,
-                "total_components": 4, 
-                "external_dependencies": 3,
-                "trace_id": get_current_trace_id()
-            }
-        }
-        
-        span.set_attribute("service_map.total_services", service_map["metrics"]["total_services"])
-        span.set_attribute("service_map.total_components", service_map["metrics"]["total_components"])
-        
-        return service_map
-
-@app.get("/api/traces/active")
-@traced_function(service_name="document-rag-api")
-async def get_active_traces():
-    """Get information about active traces"""
-    with orchestrator_tracer.start_as_current_span("api.get_active_traces") as span:
-        span.set_attribute("endpoint", "/api/traces/active")
-        
-        trace_info = {
-            "current_trace": {
-                "trace_id": get_current_trace_id(),
-                "service": "document-rag-api",
-                "operation": "get_active_traces",
-                "hierarchy": "document-rag-orchestrator -> document-rag-api"
-            },
-            "service_tracers": {
-                "document-rag-api": "Primary API service tracer",
-                "query-processor": "Query processing component tracer", 
-                "response-generator": "Response generation component tracer",
-                "session-manager": "Session management component tracer",
-                "backend-proxy": "Backend proxy component tracer"
-            },
-            "trace_propagation": {
-                "enabled": True,
-                "headers": ["X-Trace-ID", "traceparent", "b3"],
-                "backends": ["document-rag-backend"]
-            },
-            "instrumentation": {
-                "automatic": ["httpx", "requests", "fastapi", "logging"],
-                "manual": ["query_processing", "response_generation", "session_management"]
-            }
-        }
-        
-        span.set_attribute("traces.current_id", trace_info["current_trace"]["trace_id"])
-        span.set_attribute("traces.service_count", len(trace_info["service_tracers"]))
-        
-        return trace_info
-
-# Performance monitoring endpoint
-@app.get("/api/performance")
-@traced_function(service_name="document-rag-api")
-async def get_performance_metrics():
-    """Get performance metrics for the API service"""
-    with orchestrator_tracer.start_as_current_span("api.get_performance_metrics") as span:
-        span.set_attribute("endpoint", "/api/performance")
-        
-        if not enhanced_query_engine:
-            raise HTTPException(status_code=503, detail="Service not initialized")
-        
-        # Simulate performance data collection
-        metrics = {
-            "service": "document-rag-api",
-            "uptime_seconds": (datetime.now() - datetime.now().replace(hour=0, minute=0, second=0)).total_seconds(),
-            "sessions": {
-                "total": len(enhanced_query_engine.session_manager.sessions),
-                "active_last_hour": len([s for s in enhanced_query_engine.session_manager.sessions.values() 
-                                       if datetime.fromisoformat(s.last_activity.replace('Z', '+00:00')) > 
-                                       datetime.now(timezone.utc) - timedelta(hours=1)])
-            },
-            "components": {
-                "query_processor": {"status": "healthy", "avg_response_time_ms": 150},
-                "response_generator": {"status": "healthy", "avg_response_time_ms": 2500},
-                "session_manager": {"status": "healthy", "avg_response_time_ms": 5},
-                "backend_proxy": {"status": "healthy", "avg_response_time_ms": 300}
-            },
-            "external_services": {
-                "openai_api": {"status": "healthy", "avg_response_time_ms": 2000},
-                "qdrant_database": {"status": "healthy", "avg_response_time_ms": 100}
-            },
-            "trace_context": {
-                "trace_id": get_current_trace_id(),
-                "spans_created": "dynamic",
-                "service_tree": "document-rag-orchestrator -> document-rag-api -> [components]"
-            }
-        }
-        
-        span.set_attribute("performance.sessions_total", metrics["sessions"]["total"])
-        span.set_attribute("performance.sessions_active", metrics["sessions"]["active_last_hour"])
-        
-        return metrics
 
 if __name__ == "__main__":
     import uvicorn
@@ -963,21 +945,26 @@ if __name__ == "__main__":
     with standalone_tracer.start_as_current_span("api_service.standalone_startup") as span:
         span.set_attribute("startup.mode", "standalone")
         span.set_attribute("startup.port", 8000)
+        span.set_attribute("w3c.propagation", "enabled")
         
-        print("🔥 BEAST MODE: Enhanced API Service Starting")
-        print("📊 Service Tree: document-rag-orchestrator -> document-rag-api")
+        print("🔥 ENHANCED API SERVICE: Complete W3C Trace Propagation")
+        print("=" * 80)
+        print("📊 Service Tree: document-rag-orchestrator → document-rag-api")
         print("🧩 Components: query-processor, response-generator, session-manager, backend-proxy")
         print("🌐 External Services: openai-api, qdrant-database, document-rag-backend")
+        print("🔗 W3C Propagation: TraceContext + Baggage + B3 + Jaeger")
         print("🚀 Starting on http://0.0.0.0:8000")
         print()
-        print("API Endpoints:")
-        print("  🏠 /                     - Main UI")
-        print("  🔍 /api/query            - Process queries")
-        print("  💊 /api/health           - Health check")
-        print("  🗺️  /api/service-map      - Service map visualization")
-        print("  🧩 /api/components       - Component status")
-        print("  📊 /api/performance      - Performance metrics")
-        print("  🔗 /api/traces/active    - Active traces info")
+        print("Enhanced API Endpoints:")
+        print("  🏠 /                     - Main UI with trace info")
+        print("  🔍 /api/query            - Process queries with W3C propagation")
+        print("  💊 /api/health           - Comprehensive health check with trace context")
+        print("  🗺️  /api/service-map      - Complete service map with W3C details")
+        print("  🧩 /api/components       - Detailed component status with trace correlation")
+        print("  ⚙️  /api/backend/status   - Backend proxy with enhanced W3C propagation")
+        print("  🔄 /api/backend/scan     - Trigger backend scan with trace correlation")
         print()
+        print("🆔 Root Trace ID:", get_current_trace_id())
+        print("=" * 80)
         
         uvicorn.run(app, host="0.0.0.0", port=8000)

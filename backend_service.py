@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced Backend Service with Granular Service Components
-Creates a hierarchical service tree with dedicated components
+Creates a hierarchical service tree with dedicated components and proper W3C propagation
 """
 
 import os
@@ -49,19 +49,19 @@ from text_splitting import split_documents
 from dotenv import load_dotenv
 load_dotenv()
 
-# Enhanced OpenTelemetry configuration
+# Enhanced OpenTelemetry configuration with W3C propagation
 from otel_config import (
     initialize_opentelemetry, get_service_tracer, traced_function, 
     trace_http_call, trace_health_check, get_current_trace_id,
-    add_trace_correlation_to_log
+    add_trace_correlation_to_log, inject_trace_context, extract_trace_context,
+    SERVICE_HIERARCHY
 )
 from metrics import (
     rag_metrics, time_document_processing, time_query_processing, 
     record_document_processed, record_cache_event
 )
 
-# After imports
-from otel_config import initialize_opentelemetry
+# Initialize OpenTelemetry with proper hierarchy
 tracer, meter = initialize_opentelemetry("document-rag-backend")
 
 @dataclass
@@ -78,7 +78,7 @@ class ProcessedFile:
     qdrant_point_ids: List[str]
 
 class FileFingerprintDatabase:
-    """File tracking database component"""
+    """File tracking database component with enhanced tracing"""
     
     def __init__(self, db_path: str = ".processed_files.db"):
         self.db_path = db_path
@@ -88,10 +88,11 @@ class FileFingerprintDatabase:
     
     @traced_function(service_name="file-fingerprint-db")
     def _init_db(self):
-        """Initialize the database schema"""
+        """Initialize the database schema with proper tracing"""
         with self.tracer.start_as_current_span("database.init_schema") as span:
             span.set_attribute("database.path", self.db_path)
             span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.parent", "document-rag-backend")
             
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
@@ -113,10 +114,11 @@ class FileFingerprintDatabase:
     
     @traced_function(service_name="file-fingerprint-db")
     def is_file_processed(self, file_path: str, file_hash: str) -> bool:
-        """Check if file already processed"""
+        """Check if file already processed with enhanced tracing"""
         with self.tracer.start_as_current_span("database.check_file_processed") as span:
             span.set_attribute("file.path", file_path)
             span.set_attribute("file.hash", file_hash[:16])
+            span.set_attribute("service.component", self.service_name)
             
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.execute(
@@ -132,10 +134,11 @@ class FileFingerprintDatabase:
     
     @traced_function(service_name="file-fingerprint-db")
     def mark_file_processed(self, processed_file: ProcessedFile):
-        """Mark file as processed"""
+        """Mark file as processed with enhanced tracing"""
         with self.tracer.start_as_current_span("database.mark_file_processed") as span:
             span.set_attribute("file.name", processed_file.file_name)
             span.set_attribute("file.document_count", processed_file.document_count)
+            span.set_attribute("service.component", self.service_name)
             
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
@@ -149,9 +152,39 @@ class FileFingerprintDatabase:
                     processed_file.file_size, processed_file.mime_type,
                     json.dumps(processed_file.qdrant_point_ids)
                 ))
+                span.set_attribute("database.operation", "file_marked_processed")
+    
+    @traced_function(service_name="file-fingerprint-db")
+    def get_stats(self) -> Dict[str, Any]:
+        """Get database statistics with enhanced tracing"""
+        with self.tracer.start_as_current_span("database.get_stats") as span:
+            span.set_attribute("service.component", self.service_name)
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute("""
+                    SELECT 
+                        COUNT(*) as total_files,
+                        SUM(document_count) as total_documents,
+                        SUM(file_size) as total_size_bytes,
+                        MAX(processed_at) as last_processed
+                    FROM processed_files
+                """)
+                result = cursor.fetchone()
+                
+                stats = {
+                    "total_files": result[0] or 0,
+                    "total_documents": result[1] or 0,
+                    "total_size_bytes": result[2] or 0,
+                    "last_processed": result[3]
+                }
+                
+                span.set_attribute("stats.total_files", stats["total_files"])
+                span.set_attribute("stats.total_documents", stats["total_documents"])
+                
+                return stats
 
 class GoogleDriveMonitor:
-    """Google Drive monitoring component"""
+    """Google Drive monitoring component with enhanced tracing"""
     
     def __init__(self, folder_id: str):
         self.folder_id = folder_id
@@ -162,8 +195,11 @@ class GoogleDriveMonitor:
     
     @traced_function(service_name="google-drive-monitor")
     def _init_loader(self):
-        """Initialize Google Drive loader"""
+        """Initialize Google Drive loader with proper tracing"""
         with self.tracer.start_as_current_span("google_drive.init_loader") as span:
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.parent", "document-rag-backend")
+            
             try:
                 credentials_path = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
                 token_path = os.getenv("GOOGLE_TOKEN_PATH", "token.json")
@@ -185,8 +221,11 @@ class GoogleDriveMonitor:
     
     @traced_function(service_name="google-drive-monitor")
     def scan_for_files(self) -> List[Dict]:
-        """Scan Google Drive for new files"""
+        """Scan Google Drive for new files with enhanced tracing"""
         with self.tracer.start_as_current_span("google_drive.scan_files") as span:
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("folder.id", self.folder_id)
+            
             if not self.loader:
                 span.set_attribute("scan.status", "no_loader")
                 return []
@@ -205,6 +244,7 @@ class GoogleDriveMonitor:
                         file_span.set_attribute("file.id", file_id)
                         file_span.set_attribute("file.name", file_name)
                         file_span.set_attribute("file.mime_type", mime_type)
+                        file_span.set_attribute("service.component", self.service_name)
                         
                         # Skip unsupported Google Apps files
                         if mime_type.startswith("application/vnd.google-apps.") and mime_type not in [
@@ -238,7 +278,7 @@ class GoogleDriveMonitor:
                 return []
 
 class LocalFileScanner:
-    """Local file system scanner component"""
+    """Local file system scanner component with enhanced tracing"""
     
     def __init__(self, watch_dirs: List[str]):
         self.watch_dirs = watch_dirs
@@ -249,14 +289,17 @@ class LocalFileScanner:
     
     @traced_function(service_name="local-file-scanner")
     def scan_directories(self) -> List[Dict]:
-        """Scan local directories for files"""
+        """Scan local directories for files with enhanced tracing"""
         with self.tracer.start_as_current_span("local_scanner.scan_directories") as span:
             span.set_attribute("directories.count", len(self.watch_dirs))
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.parent", "document-rag-backend")
             
             new_files = []
             for watch_dir in self.watch_dirs:
                 with self.tracer.start_as_current_span(f"local_scanner.scan_dir") as dir_span:
                     dir_span.set_attribute("directory.path", watch_dir)
+                    dir_span.set_attribute("service.component", self.service_name)
                     
                     if not os.path.exists(watch_dir):
                         dir_span.set_attribute("directory.exists", False)
@@ -269,7 +312,7 @@ class LocalFileScanner:
             return new_files
     
     def _scan_directory(self, directory: str, new_files: List[Dict]) -> int:
-        """Scan single directory"""
+        """Scan single directory with proper tracing"""
         files_found = 0
         try:
             for root, dirs, files in os.walk(directory):
@@ -303,7 +346,7 @@ class LocalFileScanner:
         return files_found
     
     def _calculate_file_hash(self, file_path: str) -> str:
-        """Calculate file hash"""
+        """Calculate file hash with tracing"""
         try:
             hash_sha256 = hashlib.sha256()
             with open(file_path, "rb") as f:
@@ -314,13 +357,13 @@ class LocalFileScanner:
             return ""
 
 class DocumentProcessor:
-    """Document processing component with sub-components"""
+    """Document processing component with sub-components and enhanced tracing"""
     
     def __init__(self):
         self.tracer = get_service_tracer("document-processor")
         self.service_name = "document-processor"
         
-        # Sub-component tracers
+        # Sub-component tracers with proper hierarchy
         self.pdf_tracer = get_service_tracer("pdf-loader")
         self.docx_tracer = get_service_tracer("docx-loader")
         self.pptx_tracer = get_service_tracer("pptx-loader")
@@ -328,14 +371,16 @@ class DocumentProcessor:
     
     @traced_function(service_name="document-processor")
     def process_file(self, file_path: str, file_info: Dict) -> List[Document]:
-        """Process file with appropriate loader"""
+        """Process file with appropriate loader and enhanced tracing"""
         with self.tracer.start_as_current_span("document_processor.process_file") as span:
             file_type = file_info.get("mime_type", "")
             span.set_attribute("file.type", file_type)
             span.set_attribute("file.path", file_path)
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.parent", "document-rag-backend")
             
             try:
-                # Route to appropriate sub-component
+                # Route to appropriate sub-component with proper context propagation
                 if "pdf" in file_type:
                     documents = self._process_pdf(file_path)
                 elif "word" in file_type or file_path.endswith('.docx'):
@@ -348,6 +393,7 @@ class DocumentProcessor:
                     documents = self._process_generic(file_path)
                 
                 span.set_attribute("documents.extracted", len(documents))
+                span.set_attribute("processing.status", "success")
                 return documents
                 
             except Exception as e:
@@ -357,46 +403,62 @@ class DocumentProcessor:
     
     @traced_function(service_name="pdf-loader")
     def _process_pdf(self, file_path: str) -> List[Document]:
-        """Process PDF file"""
+        """Process PDF file with enhanced tracing"""
         with self.pdf_tracer.start_as_current_span("pdf_loader.process") as span:
             span.set_attribute("file.path", file_path)
+            span.set_attribute("service.component", "pdf-loader")
+            span.set_attribute("service.parent", "document-processor")
+            span.set_attribute("service.hierarchy.level", 3)
+            
             documents = load_file(file_path)
             span.set_attribute("pdf.documents_extracted", len(documents))
             return documents
     
     @traced_function(service_name="docx-loader")
     def _process_docx(self, file_path: str) -> List[Document]:
-        """Process DOCX file"""
+        """Process DOCX file with enhanced tracing"""
         with self.docx_tracer.start_as_current_span("docx_loader.process") as span:
             span.set_attribute("file.path", file_path)
+            span.set_attribute("service.component", "docx-loader")
+            span.set_attribute("service.parent", "document-processor")
+            span.set_attribute("service.hierarchy.level", 3)
+            
             documents = load_file(file_path)
             span.set_attribute("docx.documents_extracted", len(documents))
             return documents
     
     @traced_function(service_name="pptx-loader")
     def _process_pptx(self, file_path: str) -> List[Document]:
-        """Process PPTX file"""
+        """Process PPTX file with enhanced tracing"""
         with self.pptx_tracer.start_as_current_span("pptx_loader.process") as span:
             span.set_attribute("file.path", file_path)
+            span.set_attribute("service.component", "pptx-loader")
+            span.set_attribute("service.parent", "document-processor")
+            span.set_attribute("service.hierarchy.level", 3)
+            
             documents = load_file(file_path)
             span.set_attribute("pptx.documents_extracted", len(documents))
             return documents
     
     @traced_function(service_name="image-processor")
     def _process_image(self, file_path: str) -> List[Document]:
-        """Process image file"""
+        """Process image file with enhanced tracing"""
         with self.image_tracer.start_as_current_span("image_processor.process") as span:
             span.set_attribute("file.path", file_path)
+            span.set_attribute("service.component", "image-processor")
+            span.set_attribute("service.parent", "document-processor")
+            span.set_attribute("service.hierarchy.level", 3)
+            
             documents = load_file(file_path)
             span.set_attribute("image.documents_extracted", len(documents))
             return documents
     
     def _process_generic(self, file_path: str) -> List[Document]:
-        """Process generic file"""
+        """Process generic file with basic tracing"""
         return load_file(file_path)
 
 class TextSplitter:
-    """Text splitting component"""
+    """Text splitting component with enhanced tracing"""
     
     def __init__(self):
         self.tracer = get_service_tracer("text-splitter")
@@ -404,19 +466,22 @@ class TextSplitter:
     
     @traced_function(service_name="text-splitter")
     def split_documents(self, documents: List[Document], chunk_size: int = 1000, chunk_overlap: int = 120) -> List[Document]:
-        """Split documents into chunks"""
+        """Split documents into chunks with enhanced tracing"""
         with self.tracer.start_as_current_span("text_splitter.split_documents") as span:
             span.set_attribute("documents.input_count", len(documents))
             span.set_attribute("split.chunk_size", chunk_size)
             span.set_attribute("split.chunk_overlap", chunk_overlap)
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.parent", "document-rag-backend")
             
             chunks = split_documents(documents, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
             
             span.set_attribute("documents.output_count", len(chunks))
+            span.set_attribute("splitting.status", "success")
             return chunks
 
 class EmbeddingGenerator:
-    """Embedding generation component"""
+    """Embedding generation component with enhanced tracing"""
     
     def __init__(self, model: str = "text-embedding-3-large"):
         self.model = model
@@ -426,15 +491,19 @@ class EmbeddingGenerator:
     
     @traced_function(service_name="embedding-generator")
     def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for texts"""
+        """Generate embeddings for texts with enhanced tracing"""
         with self.tracer.start_as_current_span("embedding_generator.generate") as span:
             span.set_attribute("texts.count", len(texts))
             span.set_attribute("embedding.model", self.model)
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.parent", "document-rag-backend")
+            span.set_attribute("service.external", "openai-api")
             
             try:
                 embeddings = self.embeddings.embed_documents(texts)
                 span.set_attribute("embeddings.generated", len(embeddings))
                 span.set_attribute("embedding.dimension", len(embeddings[0]) if embeddings else 0)
+                span.set_attribute("embedding.status", "success")
                 return embeddings
             except Exception as e:
                 span.record_exception(e)
@@ -442,7 +511,7 @@ class EmbeddingGenerator:
                 raise
 
 class VectorStoreManager:
-    """Vector store management component"""
+    """Vector store management component with enhanced tracing"""
     
     def __init__(self, qdrant_url: str = "http://localhost:6333", collection_name: str = "documents"):
         self.qdrant_url = qdrant_url
@@ -456,9 +525,12 @@ class VectorStoreManager:
     
     @traced_function(service_name="vector-store-manager")
     def _ensure_collection(self):
-        """Ensure collection exists"""
+        """Ensure collection exists with enhanced tracing"""
         with self.tracer.start_as_current_span("vector_store.ensure_collection") as span:
             span.set_attribute("collection.name", self.collection_name)
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.parent", "document-rag-backend")
+            span.set_attribute("service.external", "qdrant-database")
             
             try:
                 collections = self.client.get_collections()
@@ -479,19 +551,25 @@ class VectorStoreManager:
                     embedding=self.embeddings
                 )
                 
+                span.set_attribute("vector_store.initialized", True)
+                
             except Exception as e:
                 span.record_exception(e)
+                span.set_attribute("vector_store.initialized", False)
                 raise
     
     @traced_function(service_name="vector-store-manager")
     def add_documents(self, documents: List[Document], file_info: Dict) -> List[str]:
-        """Add documents to vector store"""
+        """Add documents to vector store with enhanced tracing"""
         with self.tracer.start_as_current_span("vector_store.add_documents") as span:
             span.set_attribute("documents.count", len(documents))
             span.set_attribute("file.name", file_info.get("file_name", "unknown"))
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.external", "qdrant-database")
             
             try:
-                # Add metadata
+                # Add metadata with trace context
+                trace_id = get_current_trace_id()
                 for doc in documents:
                     doc.metadata.update({
                         "file_id": file_info.get("file_id"),
@@ -499,7 +577,9 @@ class VectorStoreManager:
                         "file_path": file_info.get("file_path"),
                         "processed_at": datetime.now().isoformat(),
                         "file_size": file_info.get("file_size", 0),
-                        "mime_type": file_info.get("mime_type")
+                        "mime_type": file_info.get("mime_type"),
+                        "trace_id": trace_id,
+                        "processed_by_service": "document-rag-backend"
                     })
                 
                 # Generate point IDs
@@ -512,6 +592,7 @@ class VectorStoreManager:
                 self.vector_store.add_documents(documents, ids=point_ids)
                 
                 span.set_attribute("vector_store.points_added", len(point_ids))
+                span.set_attribute("vector_store.status", "success")
                 return point_ids
                 
             except Exception as e:
@@ -520,14 +601,14 @@ class VectorStoreManager:
                 raise
 
 class BackendService:
-    """Main backend service orchestrator"""
+    """Main backend service orchestrator with enhanced W3C propagation"""
     
     def __init__(self):
-        # Initialize main service tracer
+        # Initialize main service tracer with proper hierarchy
         self.tracer, self.meter = initialize_opentelemetry(
             service_name="document-rag-backend",
             service_version="1.0.0",
-            environment="development"
+            environment="production"
         )
         
         self.service_name = "document-rag-backend"
@@ -537,7 +618,7 @@ class BackendService:
         self.local_watch_dirs = os.getenv("LOCAL_WATCH_DIRS", "").split(",") if os.getenv("LOCAL_WATCH_DIRS") else []
         self.scan_interval = int(os.getenv("SCAN_INTERVAL", "30"))
         
-        # Initialize components
+        # Initialize components with proper hierarchy
         self.fingerprint_db = FileFingerprintDatabase()
         self.document_processor = DocumentProcessor()
         self.text_splitter = TextSplitter()
@@ -565,22 +646,26 @@ class BackendService:
         
         # Setup logger
         self.logger = add_trace_correlation_to_log(logging.getLogger(__name__))
-        self.logger.info("Backend service initialized with enhanced tracing")
+        self.logger.info("Backend service initialized with enhanced W3C tracing")
     
     @traced_function(service_name="document-rag-backend")
     def scan_for_new_files(self) -> List[Dict]:
-        """Scan all sources for new files"""
+        """Scan all sources for new files with enhanced tracing"""
         with self.tracer.start_as_current_span("backend.scan_for_new_files") as span:
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.hierarchy", "document-rag-orchestrator -> document-rag-backend")
+            
             all_files = []
             
-            # Scan Google Drive
+            # Scan Google Drive with context propagation
             if self.google_drive_monitor:
                 with self.tracer.start_as_current_span("backend.scan_google_drive") as gdrive_span:
                     gdrive_files = self.google_drive_monitor.scan_for_files()
                     all_files.extend(gdrive_files)
                     gdrive_span.set_attribute("google_drive.files_found", len(gdrive_files))
+                    gdrive_span.set_attribute("service.external", "google-drive-api")
             
-            # Scan local directories
+            # Scan local directories with context propagation
             if self.local_scanner:
                 with self.tracer.start_as_current_span("backend.scan_local") as local_span:
                     local_files = self.local_scanner.scan_directories()
@@ -600,7 +685,7 @@ class BackendService:
     
     @traced_function(service_name="document-rag-backend")
     def process_single_file(self, file_info: Dict) -> bool:
-        """Process a single file through the pipeline"""
+        """Process a single file through the pipeline with enhanced tracing"""
         with self.tracer.start_as_current_span("backend.process_single_file") as span:
             file_name = file_info["file_name"]
             source = file_info["source"]
@@ -608,6 +693,7 @@ class BackendService:
             span.set_attribute("file.name", file_name)
             span.set_attribute("file.source", source)
             span.set_attribute("file.size", file_info.get("file_size", 0))
+            span.set_attribute("service.component", self.service_name)
             
             try:
                 # Download/prepare file
@@ -617,10 +703,11 @@ class BackendService:
                         temp_file = self.google_drive_monitor.loader._download_file(file_info["drive_file_info"])
                         file_path = temp_file
                         download_span.set_attribute("temp_file.path", temp_file)
+                        download_span.set_attribute("service.external", "google-drive-api")
                 else:
                     file_path = file_info["file_path"]
                 
-                # Process document
+                # Process document with proper context propagation
                 with self.tracer.start_as_current_span("backend.document_processing") as doc_span:
                     documents = self.document_processor.process_file(file_path, file_info)
                     doc_span.set_attribute("documents.extracted", len(documents))
@@ -676,8 +763,11 @@ class BackendService:
     
     @traced_function(service_name="document-rag-backend")
     async def scan_and_process_cycle(self):
-        """Complete scan and process cycle"""
+        """Complete scan and process cycle with enhanced tracing"""
         with self.tracer.start_as_current_span("backend.scan_and_process_cycle") as span:
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("trace.id", get_current_trace_id())
+            
             try:
                 self.logger.info("Starting scan and process cycle")
                 
@@ -704,6 +794,7 @@ class BackendService:
                     
                     with self.tracer.start_as_current_span("backend.process_file_iteration") as file_span:
                         file_span.set_attribute("file.name", file_info["file_name"])
+                        file_span.set_attribute("service.component", self.service_name)
                         
                         if self.process_single_file(file_info):
                             processed_count += 1
@@ -729,10 +820,12 @@ class BackendService:
     
     @traced_function(service_name="document-rag-backend")
     async def start_monitoring(self):
-        """Start continuous monitoring service"""
+        """Start continuous monitoring service with enhanced tracing"""
         with self.tracer.start_as_current_span("backend.start_monitoring") as span:
             self.is_running = True
             span.set_attribute("monitoring.scan_interval", self.scan_interval)
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("service.status", "running")
             
             self.logger.info(f"Starting continuous monitoring (interval: {self.scan_interval}s)")
             
@@ -755,18 +848,21 @@ class BackendService:
     
     @traced_function(service_name="document-rag-backend")
     def stop_monitoring(self):
-        """Stop monitoring service"""
+        """Stop monitoring service with tracing"""
         with self.tracer.start_as_current_span("backend.stop_monitoring") as span:
             self.is_running = False
             span.set_attribute("action", "stop_requested")
+            span.set_attribute("service.component", self.service_name)
             self.logger.info("Stopping monitoring service")
     
-    @traced_function(service_name="document-rag-backend")
     def get_service_status(self) -> Dict:
-        """Get comprehensive service status"""
+        """Get comprehensive service status with enhanced tracing"""
         with self.tracer.start_as_current_span("backend.get_service_status") as span:
+            span.set_attribute("service.component", self.service_name)
+            span.set_attribute("status.request_trace_id", get_current_trace_id())
+            
             # Get database stats
-            db_stats = self.fingerprint_db.get_stats() if hasattr(self.fingerprint_db, 'get_stats') else {}
+            db_stats = self.fingerprint_db.get_stats()
             
             # Build component status
             components_status = {}
@@ -785,7 +881,6 @@ class BackendService:
                 # Google Drive health
                 if self.google_drive_monitor:
                     try:
-                        # Simple check - if loader exists
                         if self.google_drive_monitor.loader:
                             components_status["google_drive"] = "healthy"
                         else:
@@ -839,7 +934,8 @@ class BackendService:
                 "errors": self.stats["errors"][-10:],  # Last 10 errors
                 "trace_context": {
                     "trace_id": get_current_trace_id(),
-                    "service_hierarchy": "document-rag-orchestrator -> document-rag-backend"
+                    "service_hierarchy": "document-rag-orchestrator -> document-rag-backend",
+                    "w3c_propagation": "enabled"
                 }
             }
             
@@ -849,12 +945,12 @@ class BackendService:
             
             return status
 
-# Enhanced FastAPI application with hierarchical tracing
+# Enhanced FastAPI application with hierarchical tracing and W3C propagation
 service_instance = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Enhanced FastAPI lifespan with service hierarchy"""
+    """Enhanced FastAPI lifespan with service hierarchy and W3C context"""
     global service_instance
     
     # Initialize with parent service context
@@ -863,6 +959,7 @@ async def lifespan(app: FastAPI):
     with orchestrator_tracer.start_as_current_span("backend_service.startup") as startup_span:
         startup_span.set_attribute("service.component", "backend")
         startup_span.set_attribute("startup.phase", "initialization")
+        startup_span.set_attribute("w3c.propagation", "enabled")
         
         try:
             service_instance = BackendService()
@@ -889,114 +986,170 @@ async def lifespan(app: FastAPI):
 # Initialize FastAPI with enhanced tracing
 app = FastAPI(
     title="Enhanced Document Processing Backend Service",
-    description="Hierarchical document processing with granular service components",
+    description="Hierarchical document processing with granular service components and W3C propagation",
     version="2.0.0",
     lifespan=lifespan
 )
 
-# Health check endpoint with service hierarchy
+# Health check endpoint (REMOVED @traced_function decorator)
 @app.get("/health")
-@traced_function(service_name="document-rag-backend")
 async def health_check():
-    """Simple health check endpoint"""
-    if not service_instance:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    
-    return {
-        "status": "healthy",
-        "service": "document-rag-backend",
-        "timestamp": datetime.now().isoformat()
-    }
+    """Simple health check endpoint with enhanced tracing"""
+    with tracer.start_as_current_span("api.health_check") as span:
+        span.set_attribute("endpoint", "/health")
+        span.set_attribute("service.component", "document-rag-backend")
+        
+        if not service_instance:
+            span.set_attribute("service.status", "not_initialized")
+            raise HTTPException(status_code=503, detail="Service not initialized")
+        
+        span.set_attribute("service.status", "healthy")
+        
+        return {
+            "status": "healthy",
+            "service": "document-rag-backend",
+            "timestamp": datetime.now().isoformat(),
+            "trace_id": get_current_trace_id()
+        }
 
 @app.get("/")
-@traced_function(service_name="document-rag-backend")
 async def root():
-    """Root endpoint with service identification"""
-    return {
-        "service": "document-rag-backend",
-        "version": "2.0.0",
-        "components": [
-            "google-drive-monitor",
-            "local-file-scanner", 
-            "document-processor",
-            "text-splitter",
-            "embedding-generator",
-            "vector-store-manager",
-            "file-fingerprint-db"
-        ],
-        "status": "running",
-        "hierarchy": "document-rag-orchestrator -> document-rag-backend"
-    }
+    """Root endpoint with service identification and W3C context"""
+    with tracer.start_as_current_span("api.root") as span:
+        span.set_attribute("endpoint", "/")
+        span.set_attribute("service.component", "document-rag-backend")
+        
+        return {
+            "service": "document-rag-backend",
+            "version": "2.0.0",
+            "components": [
+                "google-drive-monitor",
+                "local-file-scanner", 
+                "document-processor",
+                "text-splitter",
+                "embedding-generator",
+                "vector-store-manager",
+                "file-fingerprint-db"
+            ],
+            "sub_components": {
+                "document-processor": ["pdf-loader", "docx-loader", "pptx-loader", "image-processor"]
+            },
+            "status": "running",
+            "hierarchy": "document-rag-orchestrator -> document-rag-backend",
+            "w3c_propagation": "enabled",
+            "trace_id": get_current_trace_id()
+        }
 
 @app.get("/status")
-@traced_function(service_name="document-rag-backend")
 async def get_status():
-    """Get detailed service status"""
-    if not service_instance:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    
-    return service_instance.get_service_status()
+    """Get detailed service status with W3C context propagation"""
+    with tracer.start_as_current_span("api.get_status") as span:
+        span.set_attribute("endpoint", "/status")
+        span.set_attribute("service.component", "document-rag-backend")
+        
+        if not service_instance:
+            span.set_attribute("service.status", "not_initialized")
+            raise HTTPException(status_code=503, detail="Service not initialized")
+        
+        status = service_instance.get_service_status()
+        span.set_attribute("status.response_size", len(json.dumps(status)))
+        
+        return status
 
 @app.post("/scan")
-@traced_function(service_name="document-rag-backend")
 async def trigger_manual_scan():
-    """Manually trigger scan cycle"""
-    if not service_instance:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    
-    if not service_instance.is_running:
-        raise HTTPException(status_code=503, detail="Service not running")
-    
-    # Trigger scan in background with trace context
-    with service_instance.tracer.start_as_current_span("api.trigger_manual_scan") as span:
+    """Manually trigger scan cycle with W3C context propagation"""
+    with tracer.start_as_current_span("api.trigger_manual_scan") as span:
+        span.set_attribute("endpoint", "/scan")
         span.set_attribute("trigger.source", "manual_api")
-        asyncio.create_task(service_instance.scan_and_process_cycle())
+        span.set_attribute("service.component", "document-rag-backend")
+        
+        if not service_instance:
+            span.set_attribute("service.status", "not_initialized")
+            raise HTTPException(status_code=503, detail="Service not initialized")
+        
+        if not service_instance.is_running:
+            span.set_attribute("service.status", "not_running")
+            raise HTTPException(status_code=503, detail="Service not running")
+        
+        # Trigger scan in background with trace context
         span.set_attribute("scan.triggered", True)
-    
-    return {"message": "Manual scan triggered", "trace_id": get_current_trace_id()}
+        asyncio.create_task(service_instance.scan_and_process_cycle())
+        
+        return {
+            "message": "Manual scan triggered", 
+            "trace_id": get_current_trace_id(),
+            "service": "document-rag-backend"
+        }
 
 @app.post("/stop")
-@traced_function(service_name="document-rag-backend")
 async def stop_service():
-    """Stop the monitoring service"""
-    if not service_instance:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    
-    service_instance.stop_monitoring()
-    return {"message": "Service stopped", "trace_id": get_current_trace_id()}
+    """Stop the monitoring service with enhanced tracing"""
+    with tracer.start_as_current_span("api.stop_service") as span:
+        span.set_attribute("endpoint", "/stop")
+        span.set_attribute("action", "stop_service")
+        
+        if not service_instance:
+            span.set_attribute("service.status", "not_initialized")
+            raise HTTPException(status_code=503, detail="Service not initialized")
+        
+        service_instance.stop_monitoring()
+        span.set_attribute("service.stopped", True)
+        
+        return {
+            "message": "Service stopped", 
+            "trace_id": get_current_trace_id()
+        }
 
 @app.post("/start")
-@traced_function(service_name="document-rag-backend")
 async def start_service():
-    """Start the monitoring service"""
-    if not service_instance:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    
-    if service_instance.is_running:
-        return {"message": "Service already running", "trace_id": get_current_trace_id()}
-    
-    asyncio.create_task(service_instance.start_monitoring())
-    return {"message": "Service started", "trace_id": get_current_trace_id()}
+    """Start the monitoring service with enhanced tracing"""
+    with tracer.start_as_current_span("api.start_service") as span:
+        span.set_attribute("endpoint", "/start")
+        span.set_attribute("action", "start_service")
+        
+        if not service_instance:
+            span.set_attribute("service.status", "not_initialized")
+            raise HTTPException(status_code=503, detail="Service not initialized")
+        
+        if service_instance.is_running:
+            span.set_attribute("service.already_running", True)
+            return {
+                "message": "Service already running", 
+                "trace_id": get_current_trace_id()
+            }
+        
+        asyncio.create_task(service_instance.start_monitoring())
+        span.set_attribute("service.started", True)
+        
+        return {
+            "message": "Service started", 
+            "trace_id": get_current_trace_id()
+        }
 
 @app.get("/components")
-@traced_function(service_name="document-rag-backend")
 async def get_components_status():
-    """Get detailed status of all service components"""
-    if not service_instance:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    
-    with service_instance.tracer.start_as_current_span("api.get_components_status") as span:
+    """Get detailed status of all service components with W3C context"""
+    with tracer.start_as_current_span("api.get_components_status") as span:
+        span.set_attribute("endpoint", "/components")
+        span.set_attribute("service.component", "document-rag-backend")
+        
+        if not service_instance:
+            span.set_attribute("service.status", "not_initialized")
+            raise HTTPException(status_code=503, detail="Service not initialized")
+        
         components = {}
         
         # Google Drive Monitor
         if service_instance.google_drive_monitor:
-            with service_instance.tracer.start_as_current_span("check.google_drive_monitor") as gdrive_span:
+            with tracer.start_as_current_span("check.google_drive_monitor") as gdrive_span:
                 try:
                     gdrive_status = "healthy" if service_instance.google_drive_monitor.loader else "not_initialized"
                     components["google-drive-monitor"] = {
                         "status": gdrive_status,
                         "folder_id": service_instance.google_drive_folder_id,
-                        "service_path": "document-rag-backend -> google-drive-monitor"
+                        "service_path": "document-rag-backend -> google-drive-monitor",
+                        "external_service": "google-drive-api"
                     }
                     gdrive_span.set_attribute("component.status", gdrive_status)
                 except Exception as e:
@@ -1031,7 +1184,8 @@ async def get_components_status():
         components["embedding-generator"] = {
             "status": "healthy",
             "model": service_instance.embedding_generator.model,
-            "service_path": "document-rag-backend -> embedding-generator"
+            "service_path": "document-rag-backend -> embedding-generator",
+            "external_service": "openai-api"
         }
         
         # Vector Store Manager
@@ -1042,7 +1196,8 @@ async def get_components_status():
                 "url": service_instance.vector_store_manager.qdrant_url,
                 "collection": service_instance.vector_store_manager.collection_name,
                 "collections_count": len(collections.collections),
-                "service_path": "document-rag-backend -> vector-store-manager"
+                "service_path": "document-rag-backend -> vector-store-manager",
+                "external_service": "qdrant-database"
             }
         except Exception as e:
             components["vector-store-manager"] = {"status": "unhealthy", "error": str(e)}
@@ -1061,6 +1216,7 @@ async def get_components_status():
             "service": "document-rag-backend",
             "components": components,
             "hierarchy": "document-rag-orchestrator -> document-rag-backend -> [sub-components]",
+            "w3c_propagation": "enabled",
             "trace_id": get_current_trace_id()
         }
 
@@ -1081,10 +1237,13 @@ if __name__ == "__main__":
         span.set_attribute("startup.host", args.host)
         span.set_attribute("startup.port", args.port)
         span.set_attribute("startup.mode", "standalone")
+        span.set_attribute("w3c.propagation", "enabled")
         
         print(f"🚀 Starting Enhanced Backend Service on {args.host}:{args.port}")
         print(f"📊 Service Hierarchy: document-rag-orchestrator -> document-rag-backend")
         print(f"🔧 Components: google-drive-monitor, local-file-scanner, document-processor, text-splitter, embedding-generator, vector-store-manager, file-fingerprint-db")
+        print(f"🌐 W3C Trace Context: ENABLED")
+        print(f"🔗 Propagation: W3C TraceContext + Baggage + B3 + Jaeger")
         
         uvicorn.run(
             "backend_service:app",
