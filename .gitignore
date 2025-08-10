@@ -12,6 +12,7 @@ node_modules/
 # Environment variables
 .env
 .venv
+.processed_files.db
 
 # Editor directories and files
 .idea
