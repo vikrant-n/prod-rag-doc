@@ -2,6 +2,7 @@
 """
 Enhanced OpenTelemetry Configuration for Document RAG System
 Provides hierarchical service tracing with proper W3C context propagation
+Modified for middleware-based trace continuity approach
 """
 
 import os
@@ -35,7 +36,11 @@ from opentelemetry.propagators.jaeger import JaegerPropagator
 from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 
 from opentelemetry.trace import Status, StatusCode
+from opentelemetry.context import attach, detach
 
+# FastAPI middleware imports
+from fastapi import Request, FastAPI
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # Global state management
 _initialized_services = set()
@@ -100,13 +105,76 @@ SERVICE_HIERARCHY = {
     "image-processor": {"parent": "document-processor", "type": "sub_component"},
 }
 
+
+# CRITICAL: Trace Context Middleware for FastAPI
+class TraceContextMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware to extract and activate W3C trace context from incoming HTTP requests
+    This is the KEY component for trace continuity across service boundaries
+    """
+    
+    def __init__(self, app, service_name: str = None):
+        super().__init__(app)
+        self.service_name = service_name
+    
+    async def dispatch(self, request: Request, call_next):
+        # Extract W3C context from incoming headers
+        headers = dict(request.headers)
+        context = propagate.extract(headers)
+        
+        # Activate extracted context for this request
+        token = attach(context)
+        
+        # Add service context information to current span
+        current_span = trace.get_current_span()
+        if current_span.is_recording() and self.service_name:
+            # Add service hierarchy information
+            hierarchy_info = SERVICE_HIERARCHY.get(self.service_name, {})
+            current_span.set_attribute("service.name", self.service_name)
+            current_span.set_attribute("service.type", hierarchy_info.get("type", "service"))
+            
+            parent_service = hierarchy_info.get("parent")
+            if parent_service:
+                current_span.set_attribute("service.parent", parent_service)
+                current_span.set_attribute("service.hierarchy.level", _get_hierarchy_level(self.service_name))
+            
+            # Add HTTP request information
+            current_span.set_attribute("http.method", request.method)
+            current_span.set_attribute("http.url", str(request.url))
+            current_span.set_attribute("http.route", request.url.path)
+        
+        try:
+            response = await call_next(request)
+            
+            # Add response information to span
+            if current_span.is_recording():
+                current_span.set_attribute("http.status_code", response.status_code)
+                current_span.set_attribute("http.status_class", f"{response.status_code // 100}xx")
+                
+                if response.status_code >= 400:
+                    current_span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
+                else:
+                    current_span.set_status(Status(StatusCode.OK))
+            
+            return response
+            
+        except Exception as e:
+            # Record exception in span
+            if current_span.is_recording():
+                current_span.record_exception(e)
+                current_span.set_status(Status(StatusCode.ERROR, str(e)))
+            raise
+        finally:
+            # Always detach context
+            detach(token)
+
+
 def setup_enhanced_propagators():
     """
     Setup enhanced propagators following W3C standards with fallbacks
     Based on OpenTelemetry best practices for distributed tracing
     """
     # Create composite propagator with W3C as primary and fallbacks
-    # This ensures maximum compatibility across different systems
     propagators = [
         TraceContextTextMapPropagator(),  # W3C Trace Context (primary)
         W3CBaggagePropagator(),          # W3C Baggage (for context data)
@@ -120,6 +188,7 @@ def setup_enhanced_propagators():
     
     print(f"✅ Enhanced propagators configured: W3C TraceContext (primary) + B3 + Jaeger")
     return composite_propagator
+
 
 def create_enhanced_resource(service_name: str, service_version: str, environment: str) -> Resource:
     """Create OpenTelemetry resource with enhanced hierarchical service information"""
@@ -177,6 +246,7 @@ def create_enhanced_resource(service_name: str, service_version: str, environmen
     
     return Resource.create(attributes)
 
+
 def _get_hierarchy_level(service_name: str) -> int:
     """Calculate hierarchy level for service mapping"""
     level = 0
@@ -191,6 +261,7 @@ def _get_hierarchy_level(service_name: str) -> int:
             break
     
     return level
+
 
 def get_meter(service_name: str = None, service_version: str = "1.0.0"):
     """Get or create a meter for a specific service component with hierarchy"""
@@ -275,6 +346,7 @@ def initialize_opentelemetry(
     
     return tracer, meter
 
+
 def _initialize_global_providers(resource: Resource):
     """Initialize global trace and metric providers with enhanced configuration"""
     
@@ -332,8 +404,9 @@ def _initialize_global_providers(resource: Resource):
     # Initialize enhanced auto-instrumentation
     _setup_enhanced_auto_instrumentation()
 
+
 def _setup_enhanced_auto_instrumentation():
-    """Setup enhanced automatic instrumentation for common libraries"""
+    """Setup enhanced automatic instrumentation for common libraries - MODIFIED"""
     try:
         # Enhanced logging instrumentation
         LoggingInstrumentor().instrument(
@@ -357,13 +430,10 @@ def _setup_enhanced_auto_instrumentation():
     except Exception:
         pass
     
-    try:
-        # Enhanced FastAPI instrumentation
-        FastAPIInstrumentor().instrument_app(
-            excluded_urls="healthcheck,metrics,static"
-        )
-    except Exception:
-        pass
+    # REMOVED: Global FastAPI instrumentation
+    # This conflicted with our middleware approach
+    # Individual apps will be instrumented manually
+
 
 def _configure_enhanced_logging():
     """Configure enhanced logging with trace correlation"""
@@ -372,8 +442,47 @@ def _configure_enhanced_logging():
         format='%(asctime)s - %(name)s - %(levelname)s - [service=%(service_name)s trace_id=%(otelTraceID)s span_id=%(otelSpanID)s] - %(message)s'
     )
 
-# Enhanced utility functions for service hierarchy and context propagation
 
+# CRITICAL: FastAPI App Instrumentation Function
+def instrument_fastapi_app(app: FastAPI, service_name: str):
+    """Instrument FastAPI app with middleware approach"""
+    from middleware.trace_middleware import TraceContextMiddleware
+    
+    # Add middleware FIRST
+    app.add_middleware(TraceContextMiddleware, service_name=service_name)
+    
+    # Then FastAPI instrumentation
+    try:
+        FastAPIInstrumentor().instrument_app(app, excluded_urls="health,metrics")
+        print(f"✅ FastAPI instrumentation added for {service_name}")
+    except Exception as e:
+        print(f"⚠️  FastAPI instrumentation warning: {e}")
+    
+    return app
+
+# Enhanced HTTP client wrapper - SIMPLIFIED
+class TracedHTTPXClient:
+    def __init__(self, service_name: str = None, **kwargs):
+        import httpx
+        self.service_name = service_name
+        self.client = httpx.AsyncClient(**kwargs)
+    
+    async def request(self, method: str, url: str, headers: dict = None, **kwargs):
+        injected_headers = inject_trace_context(headers or {})
+        if self.service_name:
+            injected_headers["X-Source-Service"] = self.service_name
+        return await self.client.request(method, url, headers=injected_headers, **kwargs)
+    
+    async def get(self, url: str, **kwargs): 
+        return await self.request("GET", url, **kwargs)
+    async def post(self, url: str, **kwargs): 
+        return await self.request("POST", url, **kwargs)
+    
+    async def __aenter__(self): return self
+    async def __aexit__(self, *args): await self.client.aclose()
+
+
+# Enhanced utility functions for service hierarchy and context propagation
 def get_service_tracer(service_name: str) -> trace.Tracer:
     """Get or create a tracer for a specific service component with hierarchy"""
     if service_name not in _initialized_services:
@@ -392,6 +501,7 @@ def get_service_tracer(service_name: str) -> trace.Tracer:
         "1.0.0",
         schema_url="https://opentelemetry.io/schemas/1.21.0"
     )
+
 
 def create_child_span_with_context(
     parent_span, 
@@ -423,24 +533,29 @@ def create_child_span_with_context(
         
         return span
 
-# Enhanced propagation utilities for HTTP calls
 
-def inject_trace_context(headers: dict) -> dict:
-    """Inject current trace context into HTTP headers using W3C standard"""
+# CRITICAL: Enhanced propagation utilities for HTTP calls
+def inject_trace_context(headers: dict = None) -> dict:
+    """
+    Inject current trace context into HTTP headers using W3C standard
+    CRITICAL: This must be called before every HTTP request to other services
+    """
     if headers is None:
         headers = {}
     
     # Use global propagator to inject context
     propagate.inject(headers)
     
-    # Add custom correlation headers
+    # Add custom correlation headers for debugging
     current_span = trace.get_current_span()
     if current_span.is_recording():
         span_context = current_span.get_span_context()
         headers["X-Trace-ID"] = format(span_context.trace_id, '032x')
         headers["X-Span-ID"] = format(span_context.span_id, '016x')
+        headers["X-Service-Source"] = os.getenv("SERVICE_NAME", "unknown")
     
     return headers
+
 
 def extract_trace_context(headers: dict):
     """Extract trace context from HTTP headers using W3C standard"""
@@ -450,119 +565,67 @@ def extract_trace_context(headers: dict):
     # Use global propagator to extract context
     return propagate.extract(headers)
 
-# Enhanced tracing decorators
 
-def traced_function(operation_name: str = None, service_name: str = None, **span_attributes):
-    """Enhanced decorator for automatic function tracing with service context"""
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            tracer = get_service_tracer(service_name) if service_name else trace.get_tracer(__name__)
-            span_name = operation_name or f"{func.__module__}.{func.__name__}"
-            
-            with tracer.start_as_current_span(
-                span_name,
-                attributes=span_attributes
-            ) as span:
-                try:
-                    # Add enhanced function metadata
-                    span.set_attribute("function.name", func.__name__)
-                    span.set_attribute("function.module", func.__module__)
-                    span.set_attribute("function.file", func.__code__.co_filename)
-                    span.set_attribute("function.line", func.__code__.co_firstlineno)
-                    
-                    if service_name:
-                        hierarchy_info = SERVICE_HIERARCHY.get(service_name, {})
-                        span.set_attribute("service.component", service_name)
-                        span.set_attribute("service.type", hierarchy_info.get("type", "component"))
-                        
-                        parent_service = hierarchy_info.get("parent")
-                        if parent_service:
-                            span.set_attribute("service.parent", parent_service)
-                    
-                    # Execute function
-                    result = func(*args, **kwargs)
-                    
-                    # Add result metadata if available
-                    if hasattr(result, '__len__'):
-                        try:
-                            span.set_attribute("result.length", len(result))
-                        except:
-                            pass
-                    
-                    span.set_attribute("function.status", "success")
-                    span.set_status(Status(StatusCode.OK))
-                    return result
-                    
-                except Exception as e:
-                    span.record_exception(e)
-                    span.set_attribute("function.status", "error")
-                    span.set_attribute("error.type", type(e).__name__)
-                    span.set_attribute("error.message", str(e))
-                    span.set_status(Status(StatusCode.ERROR, str(e)))
-                    raise
-        return wrapper
-    return decorator
+def extract_and_activate_context(headers: dict):
+    """
+    Extract AND activate trace context from HTTP headers
+    Returns token for cleanup - MUST be used with detach()
+    """
+    if not headers:
+        return None
+    
+    # Extract context
+    context = propagate.extract(headers)
+    
+    # Activate context for current execution
+    token = attach(context)
+    return token
 
-def trace_http_call(method: str, url: str, service_name: str = None):
-    """Enhanced decorator for HTTP calls with proper W3C trace propagation"""
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            tracer = get_service_tracer(service_name) if service_name else trace.get_tracer(__name__)
-            
-            with tracer.start_as_current_span(
-                f"HTTP {method.upper()}",
-                kind=trace.SpanKind.CLIENT,
-                attributes={
-                    "http.method": method.upper(),
-                    "http.url": url,
-                    "http.scheme": url.split("://")[0] if "://" in url else "http",
-                    "net.peer.name": url.split("://")[1].split("/")[0] if "://" in url else url.split("/")[0]
-                }
-            ) as span:
-                
-                if service_name:
-                    hierarchy_info = SERVICE_HIERARCHY.get(service_name, {})
-                    span.set_attribute("service.component", service_name)
-                    span.set_attribute("service.type", hierarchy_info.get("type", "component"))
-                
-                # Enhanced header injection with W3C propagation
-                headers = kwargs.get('headers', {})
-                headers = inject_trace_context(headers)
-                kwargs['headers'] = headers
-                
-                try:
-                    result = func(*args, **kwargs)
-                    
-                    # Add enhanced response attributes
-                    if hasattr(result, 'status_code'):
-                        span.set_attribute("http.status_code", result.status_code)
-                        span.set_attribute("http.status_class", f"{result.status_code // 100}xx")
-                        
-                        if result.status_code >= 400:
-                            span.set_status(trace.Status.Error, f"HTTP {result.status_code}")
-                        else:
-                            span.set_status(Status(StatusCode.OK))
-                    
-                    if hasattr(result, 'headers'):
-                        content_length = result.headers.get('content-length')
-                        if content_length:
-                            span.set_attribute("http.response_content_length", int(content_length))
-                    
-                    span.set_attribute("http.client.status", "success")
-                    return result
-                    
-                except Exception as e:
-                    span.record_exception(e)
-                    span.set_attribute("http.client.status", "error")
-                    span.set_attribute("error.type", type(e).__name__)
-                    span.set_status(trace.Status.Error, str(e))
-                    raise
-                    
-        return wrapper
-    return decorator
+
+# Enhanced HTTP client wrapper for automatic context injection
+class TracedHTTPXClient:
+    """
+    Wrapper for httpx.AsyncClient that automatically injects trace context
+    Use this instead of direct httpx.AsyncClient for inter-service calls
+    """
+    
+    def __init__(self, service_name: str = None, **kwargs):
+        import httpx
+        self.service_name = service_name
+        self.client = httpx.AsyncClient(**kwargs)
+    
+    async def request(self, method: str, url: str, headers: dict = None, **kwargs):
+        """Make HTTP request with automatic trace context injection"""
+        # Inject trace context into headers
+        injected_headers = inject_trace_context(headers)
+        
+        # Add service identification
+        if self.service_name:
+            injected_headers["X-Source-Service"] = self.service_name
+        
+        # Make request with injected headers
+        return await self.client.request(method, url, headers=injected_headers, **kwargs)
+    
+    async def get(self, url: str, headers: dict = None, **kwargs):
+        return await self.request("GET", url, headers, **kwargs)
+    
+    async def post(self, url: str, headers: dict = None, **kwargs):
+        return await self.request("POST", url, headers, **kwargs)
+    
+    async def put(self, url: str, headers: dict = None, **kwargs):
+        return await self.request("PUT", url, headers, **kwargs)
+    
+    async def delete(self, url: str, headers: dict = None, **kwargs):
+        return await self.request("DELETE", url, headers, **kwargs)
+    
+    async def __aenter__(self):
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.client.aclose()
+
 
 # Context correlation helpers
-
 def get_current_trace_context() -> Dict[str, str]:
     """Get current trace context with enhanced information"""
     span = trace.get_current_span()
@@ -576,18 +639,20 @@ def get_current_trace_context() -> Dict[str, str]:
         }
     return {"trace_id": "", "span_id": "", "trace_flags": "", "trace_state": ""}
 
+
 def get_current_trace_id() -> str:
     """Get current trace ID for HTTP headers and correlation"""
     context = get_current_trace_context()
     return context.get("trace_id", "")
+
 
 def get_current_span_id() -> str:
     """Get current span ID for HTTP headers and correlation"""
     context = get_current_trace_context()
     return context.get("span_id", "")
 
-# Enhanced logging correlation
 
+# Enhanced logging correlation
 def add_trace_correlation_to_log(logger):
     """Add enhanced trace correlation to log records"""
     original_log = logger._log
@@ -614,8 +679,8 @@ def add_trace_correlation_to_log(logger):
     logger._log = correlated_log
     return logger
 
-# Service health check utilities with enhanced tracing
 
+# Service health check utilities with enhanced tracing
 def trace_health_check(service_name: str, check_type: str = "basic"):
     """Context manager for enhanced health check tracing"""
     class HealthCheckTracer:
@@ -651,13 +716,14 @@ def trace_health_check(service_name: str, check_type: str = "basic"):
                 if exc_type:
                     self.span.record_exception(exc_val)
                     self.span.set_attribute("health.status", "unhealthy")
-                    self.span.set_status(trace.Status.Error, str(exc_val))
+                    self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
                 else:
                     self.span.set_attribute("health.status", "healthy")
-                    span.set_status(Status(StatusCode.OK))
+                    self.span.set_status(Status(StatusCode.OK))
                 self.span.end()
     
     return HealthCheckTracer(service_name, check_type)
+
 
 def shutdown_opentelemetry():
     """Enhanced shutdown of OpenTelemetry providers"""
@@ -677,15 +743,18 @@ def shutdown_opentelemetry():
     except Exception as e:
         print(f"⚠️  Warning during OpenTelemetry shutdown: {e}")
 
-# Export enhanced configuration
+
+# Export enhanced configuration - UPDATED
 __all__ = [
     'initialize_opentelemetry',
+    'instrument_fastapi_app',  # NEW: Critical for FastAPI apps
+    'TraceContextMiddleware',  # NEW: Middleware class
+    'TracedHTTPXClient',      # NEW: HTTP client wrapper
     'get_service_tracer',
     'get_meter', 
-    'traced_function',
-    'trace_http_call',
     'inject_trace_context',
     'extract_trace_context',
+    'extract_and_activate_context',  # NEW: Context activation
     'get_current_trace_context',
     'get_current_trace_id',
     'get_current_span_id',

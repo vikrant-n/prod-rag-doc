@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced API Service Launcher with W3C Trace Propagation
-Starts the Document RAG API service with proper OpenTelemetry integration
+Middleware-based approach without decorators
 """
 
 import os
@@ -9,94 +9,57 @@ import sys
 import time
 import signal
 import logging
+import asyncio
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-# Force service name early for proper initialization
+# Force service name early
 os.environ["OTEL_SERVICE_NAME"] = "document-rag-api"
 
-# Load environment variables
 from dotenv import load_dotenv
 load_dotenv()
 
-# Enhanced OpenTelemetry configuration with W3C propagation
+# OpenTelemetry imports - NO DECORATORS
 from otel_config import (
-    initialize_opentelemetry, get_service_tracer, traced_function,
-    add_trace_correlation_to_log, get_current_trace_id,
-    inject_trace_context, SERVICE_HIERARCHY
+    initialize_opentelemetry, get_service_tracer,
+    get_current_trace_id, inject_trace_context, 
+    extract_and_activate_context, SERVICE_HIERARCHY
 )
 
-# Initialize OpenTelemetry for API service launcher
-tracer, meter = initialize_opentelemetry(
-    service_name="document-rag-api",
-    service_version="2.0.0",
-    environment="production"
-)
-
-# Setup enhanced logging with trace correlation
-logger = add_trace_correlation_to_log(logging.getLogger(__name__))
+# Initialize OpenTelemetry
+tracer, meter = initialize_opentelemetry("document-rag-api", "2.0.0", "production")
 
 class APIServiceLauncher:
-    """Enhanced API service launcher with proper service hierarchy"""
+    """API service launcher with middleware-based tracing"""
     
     def __init__(self):
         self.tracer = tracer
         self.service_name = "document-rag-api"
-        self.logger = logger
-        
-        # Get orchestrator tracer for parent context
-        self.orchestrator_tracer = get_service_tracer("document-rag-orchestrator")
-        
-        # Service configuration
         self.host = os.getenv("SERVER_HOST", "0.0.0.0")
         self.port = int(os.getenv("SERVER_PORT", "8000"))
         
-        self.logger.info("API Service Launcher initialized with W3C trace propagation")
+        # Extract parent context from environment if available
+        parent_trace_id = os.getenv("OTEL_PARENT_TRACE_ID")
+        if parent_trace_id:
+            print(f"🔗 Inheriting parent trace: {parent_trace_id[:8]}...")
     
-    @traced_function(service_name="document-rag-api")
     def check_environment(self) -> bool:
-        """Comprehensive environment validation with tracing"""
-        with self.tracer.start_as_current_span("api_launcher.check_environment") as span:
-            span.set_attribute("environment.check_type", "comprehensive")
-            span.set_attribute("service.component", self.service_name)
-            span.set_attribute("service.parent", "document-rag-orchestrator")
+        """Environment validation with manual spans"""
+        with self.tracer.start_as_current_span("environment_validation") as span:
+            span.set_attributes({
+                "service.component": self.service_name,
+                "service.parent": "document-rag-orchestrator",
+                "check.type": "environment"
+            })
             
-            # Check required environment variables
-            required_vars = {
-                "OPENAI_API_KEY": "OpenAI API access",
-                "OTEL_EXPORTER_OTLP_ENDPOINT": "OpenTelemetry collector endpoint"
-            }
+            required_vars = ["OPENAI_API_KEY", "OTEL_EXPORTER_OTLP_ENDPOINT"]
+            missing = [var for var in required_vars if not os.getenv(var)]
             
-            missing_vars = []
-            for var, description in required_vars.items():
-                if not os.getenv(var):
-                    missing_vars.append(f"{var} ({description})")
-            
-            span.set_attribute("environment.required_vars", len(required_vars))
-            span.set_attribute("environment.missing_vars", len(missing_vars))
-            
-            if missing_vars:
-                span.set_attribute("environment.status", "missing_vars")
-                self.logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+            if missing:
+                span.set_attribute("validation.failed", True)
+                print(f"❌ Missing required variables: {', '.join(missing)}")
                 return False
-            
-            # Check optional but recommended variables
-            optional_vars = {
-                "QDRANT_HOST": "Vector database host",
-                "QDRANT_PORT": "Vector database port", 
-                "COLLECTION_NAME": "Vector collection name",
-                "EMBEDDING_MODEL": "OpenAI embedding model"
-            }
-            
-            missing_optional = []
-            for var, description in optional_vars.items():
-                if not os.getenv(var):
-                    missing_optional.append(f"{var} ({description})")
-            
-            if missing_optional:
-                span.set_attribute("environment.missing_optional", len(missing_optional))
-                self.logger.warning(f"Using defaults for optional variables: {', '.join(missing_optional)}")
             
             # Set defaults for optional variables
             os.environ.setdefault("QDRANT_HOST", "localhost")
@@ -104,52 +67,51 @@ class APIServiceLauncher:
             os.environ.setdefault("COLLECTION_NAME", "documents")
             os.environ.setdefault("EMBEDDING_MODEL", "text-embedding-3-large")
             
-            span.set_attribute("environment.status", "ok")
-            self.logger.info("Environment validation completed successfully")
+            span.set_attribute("validation.passed", True)
+            print("✅ Environment validation passed")
             return True
     
-    @traced_function(service_name="document-rag-api")
     def check_dependencies(self) -> bool:
-        """Check service dependencies with enhanced tracing"""
-        with self.tracer.start_as_current_span("api_launcher.check_dependencies") as span:
+        """Check service dependencies with manual tracing"""
+        with self.tracer.start_as_current_span("dependency_check") as span:
             dependencies_ok = True
             
-            # Check Qdrant connection
+            # Check Qdrant
             qdrant_host = os.getenv("QDRANT_HOST", "localhost")
             qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
             
             with self.tracer.start_as_current_span("check_qdrant") as qdrant_span:
-                qdrant_span.set_attribute("qdrant.host", qdrant_host)
-                qdrant_span.set_attribute("qdrant.port", qdrant_port)
-                qdrant_span.set_attribute("service.external", "qdrant-database")
+                qdrant_span.set_attributes({
+                    "qdrant.host": qdrant_host,
+                    "qdrant.port": qdrant_port,
+                    "service.external": "qdrant-database"
+                })
                 
                 try:
                     from qdrant_client import QdrantClient
                     client = QdrantClient(host=qdrant_host, port=qdrant_port, timeout=5.0)
                     collections = client.get_collections()
                     
-                    qdrant_span.set_attribute("qdrant.status", "healthy")
-                    qdrant_span.set_attribute("qdrant.collections_count", len(collections.collections))
-                    self.logger.info(f"Qdrant accessible at {qdrant_host}:{qdrant_port} ({len(collections.collections)} collections)")
+                    qdrant_span.set_attributes({
+                        "qdrant.status": "healthy",
+                        "qdrant.collections_count": len(collections.collections)
+                    })
+                    print(f"✅ Qdrant accessible ({len(collections.collections)} collections)")
                     
-                    # Check if documents collection exists
+                    # Check documents collection
                     collection_name = os.getenv("COLLECTION_NAME", "documents")
                     try:
                         collection_info = client.get_collection(collection_name)
                         point_count = collection_info.points_count
                         qdrant_span.set_attribute("qdrant.documents_count", point_count)
-                        self.logger.info(f"Collection '{collection_name}' has {point_count} documents")
-                        
-                        if point_count == 0:
-                            self.logger.warning(f"Collection '{collection_name}' is empty - no documents available for search")
-                    except Exception as e:
-                        qdrant_span.set_attribute("qdrant.collection_status", "not_found")
-                        self.logger.warning(f"Collection '{collection_name}' not found: {e}")
+                        print(f"📄 Collection '{collection_name}' has {point_count} documents")
+                    except Exception:
+                        print(f"⚠️ Collection '{collection_name}' not found")
                         
                 except Exception as e:
                     qdrant_span.record_exception(e)
                     qdrant_span.set_attribute("qdrant.status", "unreachable")
-                    self.logger.error(f"Could not connect to Qdrant: {e}")
+                    print(f"⚠️ Qdrant connection failed: {e}")
                     dependencies_ok = False
             
             # Check OpenAI API
@@ -162,35 +124,37 @@ class APIServiceLauncher:
                     
                     if openai_key:
                         client = openai.OpenAI(api_key=openai_key)
-                        # Test with a simple model list call
                         models = client.models.list()
-                        openai_span.set_attribute("openai.status", "healthy")
-                        openai_span.set_attribute("openai.models_accessible", len(models.data))
-                        self.logger.info("OpenAI API accessible")
+                        openai_span.set_attributes({
+                            "openai.status": "healthy",
+                            "openai.models_accessible": len(models.data)
+                        })
+                        print("✅ OpenAI API accessible")
                     else:
                         openai_span.set_attribute("openai.status", "no_key")
-                        self.logger.error("OpenAI API key not provided")
+                        print("❌ OpenAI API key missing")
                         dependencies_ok = False
                         
                 except Exception as e:
                     openai_span.record_exception(e)
-                    openai_span.set_attribute("openai.status", "error")
-                    self.logger.warning(f"OpenAI API check failed: {e}")
+                    print(f"⚠️ OpenAI API check failed: {e}")
                     dependencies_ok = False
             
-            # Check backend service availability
+            # Check backend service with proper context injection
             backend_url = os.getenv("BACKEND_SERVICE_URL", "http://localhost:8001")
             with self.tracer.start_as_current_span("check_backend") as backend_span:
-                backend_span.set_attribute("backend.url", backend_url)
-                backend_span.set_attribute("service.internal", "document-rag-backend")
+                backend_span.set_attributes({
+                    "backend.url": backend_url,
+                    "service.internal": "document-rag-backend"
+                })
                 
                 try:
                     import httpx
-                    import asyncio
                     
                     async def check_backend():
+                        # CRITICAL: Inject trace context for backend call
+                        headers = inject_trace_context({})
                         async with httpx.AsyncClient() as client:
-                            headers = inject_trace_context({})
                             response = await client.get(f"{backend_url}/health", headers=headers, timeout=5.0)
                             return response.status_code == 200
                     
@@ -198,67 +162,61 @@ class APIServiceLauncher:
                     backend_span.set_attribute("backend.status", "healthy" if backend_healthy else "unhealthy")
                     
                     if backend_healthy:
-                        self.logger.info(f"Backend service accessible at {backend_url}")
+                        print(f"✅ Backend service accessible at {backend_url}")
                     else:
-                        self.logger.warning(f"Backend service at {backend_url} is not responding properly")
+                        print(f"⚠️ Backend service not responding properly")
                         
                 except Exception as e:
                     backend_span.record_exception(e)
-                    backend_span.set_attribute("backend.status", "unreachable")
-                    self.logger.warning(f"Could not connect to backend service: {e}")
-                    # Don't fail startup for backend issues - API can work independently
+                    print(f"⚠️ Backend service check failed: {e}")
             
             span.set_attribute("dependencies.all_ok", dependencies_ok)
             return dependencies_ok
     
-    @traced_function(service_name="document-rag-api")
     def setup_signal_handlers(self):
-        """Setup enhanced signal handlers for graceful shutdown"""
+        """Setup graceful shutdown handlers"""
         def signal_handler(signum, frame):
-            with self.tracer.start_as_current_span("api_launcher.graceful_shutdown") as shutdown_span:
-                shutdown_span.set_attribute("shutdown.signal", signum)
-                shutdown_span.set_attribute("shutdown.initiated_by", "signal")
-                shutdown_span.set_attribute("shutdown.trace_id", get_current_trace_id())
+            with self.tracer.start_as_current_span("graceful_shutdown") as span:
+                span.set_attributes({
+                    "shutdown.signal": signum,
+                    "shutdown.trace_id": get_current_trace_id()
+                })
                 
-                self.logger.info("🛑 Graceful shutdown initiated for API service")
+                print("\n🛑 Graceful shutdown initiated for API service")
+                print(f"🆔 Final Trace ID: {get_current_trace_id()}")
                 
-                shutdown_span.set_attribute("shutdown.graceful", True)
-                self.logger.info("✅ API service stopped gracefully")
-                self.logger.info(f"🆔 Final Trace ID: {get_current_trace_id()}")
+                # Shutdown OpenTelemetry
+                from otel_config import shutdown_opentelemetry
+                shutdown_opentelemetry()
                 
                 sys.exit(0)
         
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
     
-    @traced_function(service_name="document-rag-api")
     def start_service(self) -> bool:
-        """Start the API service with enhanced tracing and error handling"""
-        with self.orchestrator_tracer.start_as_current_span("api_service.start") as span:
-            span.set_attribute("service.name", self.service_name)
-            span.set_attribute("service.host", self.host)
-            span.set_attribute("service.port", self.port)
-            span.set_attribute("service.parent", "document-rag-orchestrator")
-            span.set_attribute("w3c.propagation", "enabled")
+        """Start API service with W3C trace propagation"""
+        with self.tracer.start_as_current_span("api_service_startup") as span:
+            span.set_attributes({
+                "service.name": self.service_name,
+                "service.host": self.host,
+                "service.port": self.port,
+                "service.parent": "document-rag-orchestrator",
+                "w3c.propagation": "enabled"
+            })
             
-            self.logger.info("🚀 Starting Enhanced Document RAG API Service")
-            self.logger.info("=" * 60)
+            print("🚀 Starting Enhanced Document RAG API Service")
+            print("=" * 65)
             
             # Environment validation
-            with self.tracer.start_as_current_span("api_service.environment_check") as env_span:
-                if not self.check_environment():
-                    env_span.set_attribute("validation.result", "failed")
-                    span.set_attribute("startup.status", "environment_failed")
-                    return False
-                env_span.set_attribute("validation.result", "passed")
+            if not self.check_environment():
+                span.set_attribute("startup.failed_reason", "environment")
+                return False
             
             # Dependencies check
-            with self.tracer.start_as_current_span("api_service.dependencies_check") as deps_span:
-                deps_ok = self.check_dependencies()
-                deps_span.set_attribute("validation.result", "passed" if deps_ok else "warning")
-                
-                if not deps_ok:
-                    self.logger.warning("⚠️ Some dependencies are not available - continuing with reduced functionality")
+            deps_ok = self.check_dependencies()
+            if not deps_ok:
+                print("⚠️ Some dependencies unavailable - continuing with reduced functionality")
             
             # Setup signal handlers
             self.setup_signal_handlers()
@@ -266,73 +224,88 @@ class APIServiceLauncher:
             # Set working directory
             script_dir = Path(__file__).parent
             os.chdir(script_dir)
-            span.set_attribute("api.working_directory", str(script_dir))
             
-            self.logger.info("🌐 API Service Configuration:")
-            self.logger.info(f"   📍 Host: {self.host}")
-            self.logger.info(f"   🔌 Port: {self.port}")
-            self.logger.info(f"   🆔 Service: {self.service_name}")
-            self.logger.info(f"   📊 Parent: document-rag-orchestrator")
-            self.logger.info(f"   🔗 W3C Propagation: ENABLED")
-            self.logger.info(f"   📡 OTLP Endpoint: {os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT')}")
+            # Display service information
+            print()
+            print("✅ API Service Ready!")
+            print("🔗 W3C Trace Propagation: ENABLED")
+            print("🗺️ Service Map: ACTIVE")
+            print()
+            print("🌐 Service Configuration:")
+            print(f"   📍 Host: {self.host}")
+            print(f"   🔌 Port: {self.port}")
+            print(f"   🆔 Service: {self.service_name}")
+            print(f"   📊 Parent: document-rag-orchestrator")
+            print(f"   🔗 Middleware: TraceContextMiddleware")
             
-            # Service hierarchy info
+            # Service hierarchy
             hierarchy_info = SERVICE_HIERARCHY.get(self.service_name, {})
             children = hierarchy_info.get("children", [])
             if children:
-                self.logger.info(f"   🧩 Components: {', '.join(children)}")
+                print(f"   🧩 Components: {', '.join(children)}")
             
-            self.logger.info("")
-            self.logger.info("🌐 API Endpoints will be available at:")
-            self.logger.info(f"   📊 Main UI:             http://{self.host}:{self.port}")
-            self.logger.info(f"   🔧 API Documentation:   http://{self.host}:{self.port}/docs")
-            self.logger.info(f"   🔍 Query API:           http://{self.host}:{self.port}/api/query")
-            self.logger.info(f"   💊 Health Check:        http://{self.host}:{self.port}/api/health")
-            self.logger.info(f"   🗺️  Service Map:         http://{self.host}:{self.port}/api/service-map")
-            self.logger.info(f"   🧩 Components:          http://{self.host}:{self.port}/api/components")
-            self.logger.info("")
+            print()
+            print("🌐 API Endpoints:")
+            print(f"   📊 Main UI:           http://{self.host}:{self.port}")
+            print(f"   📚 API Docs:          http://{self.host}:{self.port}/docs")
+            print(f"   🔍 Query API:         http://{self.host}:{self.port}/api/query")
+            print(f"   💊 Health Check:      http://{self.host}:{self.port}/api/health")
+            print(f"   🗺️  Service Map:       http://{self.host}:{self.port}/api/service-map")
             
-            # Start the server
+            print()
+            print(f"🆔 Startup Trace ID: {get_current_trace_id()}")
+            print(f"📡 OTLP Endpoint: {os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT')}")
+            print("=" * 65)
+            
+            # Start FastAPI server
             try:
                 import uvicorn
                 
-                with self.tracer.start_as_current_span("api_service.uvicorn_start") as uvicorn_span:
-                    uvicorn_span.set_attribute("uvicorn.host", self.host)
-                    uvicorn_span.set_attribute("uvicorn.port", self.port)
-                    uvicorn_span.set_attribute("uvicorn.app", "ui.api_integrated_clean:app")
+                with self.tracer.start_as_current_span("uvicorn_server_start") as uvicorn_span:
+                    uvicorn_span.set_attributes({
+                        "uvicorn.host": self.host,
+                        "uvicorn.port": self.port,
+                        "uvicorn.app": "ui.api_integrated_clean:app"
+                    })
                     
-                    self.logger.info("🔥 Starting FastAPI server with enhanced service tree...")
-                    self.logger.info(f"🆔 Startup Trace ID: {get_current_trace_id()}")
+                    print("🔥 Starting FastAPI server with middleware...")
                     
-                    # Run the FastAPI application
+                    # CRITICAL: This will use the middleware from api_integrated_clean.py
                     uvicorn.run(
                         "ui.api_integrated_clean:app",
                         host=self.host,
                         port=self.port,
-                        reload=False,  # Disable reload in production
+                        reload=False,
                         log_level="info",
                         access_log=True
                     )
                     
-                    uvicorn_span.set_attribute("uvicorn.startup", "success")
-                    span.set_attribute("startup.status", "success")
+                    span.set_attribute("startup.success", True)
                     return True
                     
             except Exception as e:
                 span.record_exception(e)
-                span.set_attribute("startup.status", "failed")
-                self.logger.error(f"❌ Failed to start API service: {e}")
+                span.set_attribute("startup.failed", True)
+                print(f"❌ Failed to start API service: {e}")
                 return False
 
 def main():
-    """Main function to start the API service"""
-    # Initialize with orchestrator context if running standalone
-    orchestrator_tracer = get_service_tracer("document-rag-orchestrator")
+    """Main entry point with parent context extraction"""
     
-    with orchestrator_tracer.start_as_current_span("api_service.main_startup") as main_span:
-        main_span.set_attribute("startup.mode", "launcher")
-        main_span.set_attribute("startup.w3c_propagation", True)
-        main_span.set_attribute("startup.service_hierarchy", True)
+    # Extract parent context from environment if running as child process
+    parent_trace_id = os.getenv("OTEL_PARENT_TRACE_ID")
+    parent_service = os.getenv("OTEL_SERVICE_PARENT", "document-rag-orchestrator")
+    
+    # Create span in orchestrator context if available
+    orchestrator_tracer = get_service_tracer(parent_service)
+    
+    with orchestrator_tracer.start_as_current_span("api_service_main") as main_span:
+        main_span.set_attributes({
+            "startup.mode": "launcher",
+            "startup.parent_trace_id": parent_trace_id or "none",
+            "startup.w3c_propagation": True,
+            "service.hierarchy": f"{parent_service} -> document-rag-api"
+        })
         
         launcher = APIServiceLauncher()
         
@@ -352,16 +325,14 @@ def main():
         except Exception as e:
             main_span.record_exception(e)
             main_span.set_attribute("startup.result", "error")
-            launcher.logger.error(f"API service error: {e}")
             print(f"❌ API service error: {e}")
             sys.exit(1)
 
 if __name__ == "__main__":
-    print("🔥 ENHANCED API SERVICE: Starting Document RAG API")
+    print("🔥 ENHANCED API SERVICE LAUNCHER")
     print("🌐 W3C Trace Context Propagation: ENABLED")
-    print("📊 Service Hierarchy: document-rag-orchestrator -> document-rag-api")
-    print("🧩 Component Tree: query-processor, response-generator, session-manager, backend-proxy")
-    print("🔗 Cross-Service Correlation: ACTIVE")
+    print("📊 Service Hierarchy: orchestrator → api → components")
+    print("🗺️ Middleware-Based Trace Continuity: ACTIVE")
     print()
     
     main()
