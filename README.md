@@ -2,6 +2,45 @@
 
 A production-ready Document Retrieval-Augmented Generation (RAG) system that processes documents from Google Drive and provides intelligent query responses using OpenAI embeddings and Qdrant vector database.
 
+## 🎯 What is This System?
+
+The Document RAG System is an intelligent document processing and query system that:
+
+- **Automatically monitors** a Google Drive folder for new documents
+- **Processes multiple file formats** (PDF, DOCX, PPTX, Excel, CSV, Images)
+- **Extracts text and images** using advanced OCR and Vision AI
+- **Creates vector embeddings** for semantic search
+- **Provides intelligent Q&A** about your documents with source citations
+- **Maintains conversation context** for better user experience
+
+## 🏗️ System Architecture
+
+```
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│   Google Drive  │───▶│  Backend Service │───▶│  Qdrant Vector  │
+│   (Documents)   │    │   (Port 8001)    │    │    Database     │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+                                │
+                                ▼
+                       ┌──────────────────┐
+                       │   API + UI       │
+                       │  (Port 8000)     │
+                       └──────────────────┘
+                                │
+                                ▼
+                       ┌──────────────────┐
+                       │   Web Interface  │
+                       │  (Chat UI)       │
+                       └──────────────────┘
+```
+
+### Core Services
+
+1. **Backend Service** (`backend_service.py`): Document processing, Google Drive monitoring
+2. **API Server** (`start_server.py`): FastAPI server with query processing
+3. **Web Interface** (`ui/static/`): Modern chat interface for document queries
+4. **Orchestrator** (`start_complete_system.py`): Manages all services
+
 ## 🚀 Quick Start
 
 ### Prerequisites
@@ -10,6 +49,13 @@ A production-ready Document Retrieval-Augmented Generation (RAG) system that pro
 2. **Qdrant vector database** running on port 6333
 3. **OpenAI API key**
 4. **Google Drive API credentials** (optional, for document monitoring)
+
+### System Requirements
+
+- **RAM**: 4GB+ (8GB+ recommended)
+- **Storage**: 10GB+ free space
+- **Network**: Internet connection for API calls
+- **OS**: Linux, macOS, or Windows
 
 ### 1. Installation
 
@@ -71,6 +117,27 @@ If you want automatic document monitoring:
 python start_complete_system.py
 ```
 
+### Alternative Startup Methods
+
+**Option A: Run Individual Services**
+```bash
+# Terminal 1: Start backend service
+python backend_service.py
+
+# Terminal 2: Start API server
+python start_server.py
+```
+
+**Option B: Use the launcher script**
+```bash
+python run_system.py
+```
+
+**Option C: Debug mode (test imports first)**
+```bash
+python debug_api.py
+```
+
 ## 🌐 Access Points
 
 Once running, access these URLs:
@@ -87,13 +154,16 @@ Once running, access these URLs:
 ```
 start_complete_system.py  # Main entry point
 ├── backend_service.py    # Document processing service (port 8001)
-└── start_server.py       # API + UI server (port 8000)
-    └── ui/
-        ├── api_integrated.py    # FastAPI application
-        └── static/
-            ├── index.html       # Web interface
-            ├── styles.css       # UI styling
-            └── app.js          # Frontend logic
+├── start_server.py       # API + UI server (port 8000)
+├── run_system.py         # Alternative launcher
+├── debug_api.py          # Debug and testing tool
+└── ui/
+    ├── api_integrated.py    # FastAPI application
+    ├── api_enhanced.py      # Enhanced features
+    └── static/
+        ├── index.html       # Web interface
+        ├── styles.css       # UI styling
+        └── app.js          # Frontend logic
 ```
 
 ### Document Processing Pipeline
@@ -104,12 +174,27 @@ Google Drive → Document Loaders → Text Splitting → OpenAI Embeddings → Q
 
 ### Supported Document Types
 
-- **PDF** files (.pdf)
-- **Word** documents (.docx)
-- **PowerPoint** presentations (.pptx)
-- **Excel** spreadsheets (.xlsx)
-- **CSV** files (.csv)
-- **Images** with OCR support (.png, .jpg, .jpeg)
+- **PDF** files (.pdf) - Text extraction + OCR + Vision AI
+- **Word** documents (.docx) - Text + tables + images + OCR
+- **PowerPoint** presentations (.pptx) - Slides + text + images
+- **Excel** spreadsheets (.xlsx) - Data + formulas + charts
+- **CSV** files (.csv) - Tabular data processing
+- **Images** (.png, .jpg, .jpeg) - OCR + Vision AI analysis
+
+### Document Processing Pipeline
+
+```
+Google Drive → Document Loaders → Text Splitting → OpenAI Embeddings → Qdrant Storage
+```
+
+### Supported Document Types
+
+- **PDF** files (.pdf) - Text extraction + OCR + Vision AI
+- **Word** documents (.docx) - Text + tables + images + OCR
+- **PowerPoint** presentations (.pptx) - Slides + text + images
+- **Excel** spreadsheets (.xlsx) - Data + formulas + charts
+- **CSV** files (.csv) - Tabular data processing
+- **Images** (.png, .jpg, .jpeg) - OCR + Vision AI analysis
 
 ## 🔧 Configuration Options
 
@@ -132,6 +217,10 @@ Google Drive → Document Loaders → Text Splitting → OpenAI Embeddings → Q
 - **Real-time Document Monitoring**: Automatically processes new Google Drive files
 - **Intelligent Chunking**: Optimized text splitting for better retrieval
 - **Multi-format Support**: Handles various document formats seamlessly
+- **OpenTelemetry Integration**: Comprehensive tracing and monitoring
+- **Vision AI Analysis**: Advanced image understanding with OpenAI Vision
+- **OCR Support**: Text extraction from images using EasyOCR
+- **Hybrid Search**: Combines vector search with BM25 for better results
 
 ## 🛠️ Development & Customization
 
@@ -153,7 +242,16 @@ The system provides RESTful API endpoints:
 
 - `POST /api/query` - Submit queries
 - `GET /api/status` - System status
+- `GET /api/health` - Health check
+- `GET /api/backend/status` - Backend service status
+- `POST /api/backend/scan` - Trigger manual document scan
 - `GET /docs` - Interactive API documentation
+
+### Development Tools
+
+- `debug_api.py` - Test imports and API creation
+- `run_system.py` - Alternative system launcher
+- OpenTelemetry integration for debugging and monitoring
 
 ## 📊 Monitoring & Logs
 
@@ -161,12 +259,21 @@ The system provides RESTful API endpoints:
 
 - `backend_service.log` - Document processing logs
 - Console output - Real-time system status
+- OpenTelemetry traces and metrics
 
 ### Health Checks
 
 - Backend Status: http://localhost:8001/status
 - Manual Scan: http://localhost:8001/scan
 - System URLs displayed on startup
+- OpenTelemetry metrics endpoint (if configured)
+
+### Monitoring Features
+
+- **Real-time Logging**: Correlated logs with trace IDs
+- **Performance Metrics**: Document processing times, API response times
+- **Service Health**: Backend and API service status monitoring
+- **Error Tracking**: Comprehensive error logging with context
 
 ## 🔒 Security Considerations
 

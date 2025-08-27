@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Enhanced Backend Service with Orchestrator Communication and Correlated Logging
+Enhanced Backend Service with Complete OpenTelemetry Instrumentation
+Fixed to match working version functionality while maintaining tracing
 """
 
 import os
@@ -9,50 +10,100 @@ import asyncio
 import logging
 import hashlib
 import json
-from datetime import datetime
-from typing import List, Dict, Optional, Any
-from dataclasses import dataclass
+import time
+import sqlite3
+import threading
+from datetime import datetime, timedelta
+from typing import List, Dict, Set, Optional, Any
+from dataclasses import dataclass, asdict
 from pathlib import Path
+import tempfile
+import shutil
 from contextlib import asynccontextmanager
 
+# Set OpenTelemetry service name early
 os.environ["OTEL_SERVICE_NAME"] = "document-rag-backend"
 
-from fastapi import FastAPI, HTTPException, Request
+# OpenTelemetry imports
+from opentelemetry import trace, metrics, propagate
+from opentelemetry.trace.status import Status, StatusCode
+
+# FastAPI imports for status API
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 import uvicorn
 import httpx
 
+# Document processing imports
 from langchain_core.documents import Document
 from langchain_qdrant import QdrantVectorStore
 from langchain_openai import OpenAIEmbeddings
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams
+from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.http.exceptions import UnexpectedResponse
 
+# Loaders
 from loaders.master_loaders import load_file
 from loaders.google_drive_loader import GoogleDriveMasterLoader
+
+# Text splitting
 from text_splitting import split_documents
 
+# Load environment variables
 from dotenv import load_dotenv
 load_dotenv()
 
-# Add correlated logging import
+# Import OpenTelemetry configuration
 from otel_config import (
     initialize_opentelemetry, get_service_tracer, instrument_fastapi_app,
     get_current_trace_id, extract_and_activate_context, TracedHTTPXClient,
-    get_correlated_logger  # NEW: Import correlated logger
+    get_correlated_logger
 )
 
+# Configuration from environment
 parent_trace_id = os.getenv("OTEL_PARENT_TRACE_ID")
 parent_service = os.getenv("OTEL_SERVICE_PARENT", "document-rag-orchestrator")
 orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8002")
 
-tracer, meter = initialize_opentelemetry("document-rag-backend", "2.0.0", "production")
+# Initialize OpenTelemetry
+tracer, meter = initialize_opentelemetry(
+    service_name="document-rag-backend",
+    service_version="2.0.0",
+    environment=os.getenv("OTEL_ENVIRONMENT", "production")
+)
 
-# Replace existing logger with correlated logger
+# Use correlated logger
 logger = get_correlated_logger(__name__)
+
+# Metrics
+documents_processed = meter.create_counter(
+    "documents_processed_total",
+    description="Total number of documents processed"
+)
+
+scan_duration = meter.create_histogram(
+    "scan_duration_seconds",
+    description="Time taken for document scanning"
+)
+
+files_processed = meter.create_counter(
+    "files_processed_total",
+    description="Total number of files processed"
+)
+
+processing_errors = meter.create_counter(
+    "processing_errors_total",
+    description="Total number of processing errors"
+)
+
+external_api_calls = meter.create_counter(
+    "external_api_calls_total",
+    description="Total number of external API calls"
+)
 
 @dataclass
 class ProcessedFile:
+    """Metadata for a processed file"""
     file_id: str
     file_name: str
     file_path: str
@@ -61,8 +112,12 @@ class ProcessedFile:
     document_count: int
     file_size: int
     mime_type: str
+    qdrant_point_ids: List[str]  # Track Qdrant point IDs for this file
+
 
 class FileFingerprintDatabase:
+    """SQLite database to track processed files and avoid reprocessing"""
+    
     def __init__(self, db_path: str = ".processed_files.db"):
         self.db_path = db_path
         self.tracer = get_service_tracer("file-fingerprint-db")
@@ -70,15 +125,26 @@ class FileFingerprintDatabase:
         self._init_db()
     
     def _init_db(self):
-        import sqlite3
+        """Initialize the database schema"""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS processed_files (
-                    file_id TEXT PRIMARY KEY, file_name TEXT NOT NULL,
-                    file_path TEXT NOT NULL, file_hash TEXT NOT NULL,
-                    processed_at TIMESTAMP NOT NULL, document_count INTEGER NOT NULL,
-                    file_size INTEGER NOT NULL, mime_type TEXT
+                    file_id TEXT PRIMARY KEY,
+                    file_name TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    file_hash TEXT NOT NULL,
+                    processed_at TIMESTAMP NOT NULL,
+                    document_count INTEGER NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    mime_type TEXT,
+                    qdrant_point_ids TEXT  -- JSON array of point IDs
                 )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_file_hash ON processed_files(file_hash)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_file_name ON processed_files(file_name)
             """)
         
         self.logger.info_with_context(
@@ -90,7 +156,7 @@ class FileFingerprintDatabase:
         )
     
     def is_file_processed(self, file_path: str, file_hash: str) -> bool:
-        import sqlite3
+        """Check if a file has already been processed"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
                 "SELECT COUNT(*) FROM processed_files WHERE file_path = ? AND file_hash = ?",
@@ -109,18 +175,54 @@ class FileFingerprintDatabase:
             )
             return result
     
+    def is_file_in_qdrant(self, file_path: str, qdrant_client) -> bool:
+        """Check if a file already has embeddings in Qdrant"""
+        try:
+            with self.tracer.start_as_current_span("qdrant_check_file_exists") as span:
+                span.set_attributes({
+                    "service.name": "document-rag-backend",
+                    "peer.service": "qdrant-database",
+                    "external.service.name": "qdrant-database",
+                    "external.service.type": "vector_database",
+                    "db.system": "qdrant",
+                    "db.operation": "scroll",
+                    "db.collection.name": "documents"
+                })
+                
+                search_result = qdrant_client.scroll(
+                    collection_name="documents",
+                    scroll_filter={
+                        "must": [
+                            {
+                                "key": "file_path",
+                                "match": {"value": file_path}
+                            }
+                        ]
+                    },
+                    limit=1,
+                    with_payload=True
+                )
+                return len(search_result[0]) > 0
+        except Exception as e:
+            return False
+    
     def mark_file_processed(self, processed_file: ProcessedFile):
-        import sqlite3
+        """Mark a file as processed"""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO processed_files 
-                (file_id, file_name, file_path, file_hash, processed_at, 
-                 document_count, file_size, mime_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (file_id, file_name, file_path, file_hash, processed_at, document_count, file_size, mime_type, qdrant_point_ids)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                processed_file.file_id, processed_file.file_name, processed_file.file_path,
-                processed_file.file_hash, processed_file.processed_at, 
-                processed_file.document_count, processed_file.file_size, processed_file.mime_type
+                processed_file.file_id,
+                processed_file.file_name,
+                processed_file.file_path,
+                processed_file.file_hash,
+                processed_file.processed_at,
+                processed_file.document_count,
+                processed_file.file_size,
+                processed_file.mime_type,
+                json.dumps(processed_file.qdrant_point_ids)
             ))
         
         self.logger.info_with_context(
@@ -133,202 +235,374 @@ class FileFingerprintDatabase:
                 "operation": "file_mark_processed"
             }
         )
+    
+    def get_processed_files(self, limit: int = 100) -> List[ProcessedFile]:
+        """Get list of processed files"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT file_id, file_name, file_path, file_hash, processed_at, 
+                       document_count, file_size, mime_type, qdrant_point_ids
+                FROM processed_files 
+                ORDER BY processed_at DESC 
+                LIMIT ?
+            """, (limit,))
+            
+            files = []
+            for row in cursor.fetchall():
+                files.append(ProcessedFile(
+                    file_id=row[0],
+                    file_name=row[1],
+                    file_path=row[2],
+                    file_hash=row[3],
+                    processed_at=datetime.fromisoformat(row[4]),
+                    document_count=row[5],
+                    file_size=row[6],
+                    mime_type=row[7],
+                    qdrant_point_ids=json.loads(row[8]) if row[8] else []
+                ))
+            return files
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get processing statistics"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT 
+                    COUNT(*) as total_files,
+                    SUM(document_count) as total_documents,
+                    SUM(file_size) as total_size,
+                    MAX(processed_at) as last_processed
+                FROM processed_files
+            """)
+            row = cursor.fetchone()
+            
+            return {
+                "total_files": row[0] or 0,
+                "total_documents": row[1] or 0,
+                "total_size_bytes": row[2] or 0,
+                "last_processed": row[3]
+            }
+    
+    def clear_processed_files(self):
+        """Clear all processed files from the database"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM processed_files")
+            conn.commit()
+
 
 class DocumentProcessor:
-    def __init__(self):
-        self.tracer = get_service_tracer("document-processor")
-        self.logger = get_correlated_logger(f"{__name__}.DocumentProcessor")
+    """Handles document processing and embedding with full tracing"""
     
-    def process_file(self, file_path: str, file_info: Dict) -> List[Document]:
-        with self.tracer.start_as_current_span("process_file") as span:
-            span.set_attribute("file.name", file_info.get("file_name"))
-            
-            self.logger.info_with_context(
-                "Starting document processing",
-                extra_attributes={
-                    "file.name": file_info.get("file_name"),
-                    "file.path": file_path,
-                    "file.source": file_info.get("source", "unknown"),
-                    "operation": "document_processing"
-                }
-            )
-            
-            try:
-                documents = load_file(file_path)
-                span.set_attribute("documents.extracted", len(documents))
-                
-                self.logger.info_with_context(
-                    "Document processing completed",
-                    extra_attributes={
-                        "file.name": file_info.get("file_name"),
-                        "documents.extracted": len(documents),
-                        "processing.status": "success",
-                        "operation": "document_processing"
-                    }
-                )
-                
-                return documents
-            except Exception as e:
-                span.record_exception(e)
-                
-                self.logger.error_with_context(
-                    "Document processing failed",
-                    extra_attributes={
-                        "file.name": file_info.get("file_name"),
-                        "file.path": file_path,
-                        "error.type": type(e).__name__,
-                        "error.message": str(e),
-                        "processing.status": "failed",
-                        "operation": "document_processing"
-                    },
-                    exc_info=True
-                )
-                return []
-
-class VectorStoreManager:
-    def __init__(self, qdrant_url: str = "http://localhost:6333", collection_name: str = "documents"):
-        self.tracer = get_service_tracer("vector-store-manager")
-        self.logger = get_correlated_logger(f"{__name__}.VectorStoreManager")
+    def __init__(self, 
+                 qdrant_url: str = "http://localhost:6333",
+                 collection_name: str = "documents",
+                 embedding_model: str = None):
         self.qdrant_url = qdrant_url
         self.collection_name = collection_name
+        self.embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
         
-        self.client = QdrantClient(url=qdrant_url)
-        self.embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-        self._ensure_collection()
+        self.tracer = get_service_tracer("document-processor")
+        self.logger = get_correlated_logger(f"{__name__}.DocumentProcessor")
+        
+        # Initialize components
+        self.embeddings = OpenAIEmbeddings(model=self.embedding_model)
+        self.qdrant_client = QdrantClient(url=qdrant_url)
+        self.vector_store = None
+        
+        # Initialize collection
+        self._ensure_collection_exists()
+        
+        self.logger.info_with_context(
+            "Document processor initialized",
+            extra_attributes={
+                "qdrant.url": qdrant_url,
+                "collection.name": collection_name,
+                "embedding.model": self.embedding_model,
+                "operation": "processor_init"
+            }
+        )
     
-    def _ensure_collection(self):
+    def _ensure_collection_exists(self):
+        """Ensure the Qdrant collection exists"""
         try:
-            collections = self.client.get_collections()
-            collection_exists = self.collection_name in [col.name for col in collections.collections]
-            
-            if not collection_exists:
-                self.client.create_collection(
-                    collection_name=self.collection_name,
-                    vectors_config=VectorParams(size=3072, distance=Distance.COSINE)
-                )
+            with self.tracer.start_as_current_span("qdrant_ensure_collection") as span:
+                span.set_attributes({
+                    "service.name": "document-rag-backend",
+                    "peer.service": "qdrant-database",
+                    "external.service.name": "qdrant-database",
+                    "external.service.type": "vector_database",
+                    "db.system": "qdrant",
+                    "db.operation": "get_collections",
+                    "db.connection_string": self.qdrant_url
+                })
                 
-                self.logger.info_with_context(
-                    "Created new Qdrant collection",
-                    extra_attributes={
-                        "collection.name": self.collection_name,
-                        "collection.vector_size": 3072,
-                        "collection.distance": "COSINE",
-                        "operation": "collection_creation"
-                    }
-                )
-            else:
-                self.logger.info_with_context(
-                    "Using existing Qdrant collection",
-                    extra_attributes={
-                        "collection.name": self.collection_name,
-                        "operation": "collection_connection"
-                    }
+                collections = self.qdrant_client.get_collections()
+                collection_names = [col.name for col in collections.collections]
+                
+                vector_size = int(os.getenv("EMBEDDING_VECTOR_SIZE", "3072"))
+                
+                if self.collection_name not in collection_names:
+                    with self.tracer.start_as_current_span("qdrant_create_collection") as create_span:
+                        create_span.set_attributes({
+                            "service.name": "document-rag-backend",
+                            "peer.service": "qdrant-database",
+                            "external.service.name": "qdrant-database",
+                            "external.service.type": "vector_database",
+                            "db.system": "qdrant",
+                            "db.operation": "create_collection",
+                            "db.collection.name": self.collection_name,
+                            "vector.size": vector_size
+                        })
+                        
+                        self.logger.info_with_context(
+                            "Creating new Qdrant collection",
+                            extra_attributes={
+                                "collection.name": self.collection_name,
+                                "vector.size": vector_size,
+                                "operation": "collection_creation"
+                            }
+                        )
+                        
+                        self.qdrant_client.create_collection(
+                            collection_name=self.collection_name,
+                            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
+                        )
+                else:
+                    self.logger.info_with_context(
+                        "Using existing Qdrant collection",
+                        extra_attributes={
+                            "collection.name": self.collection_name,
+                            "operation": "collection_connection"
+                        }
+                    )
+                    
+                self.vector_store = QdrantVectorStore(
+                    client=self.qdrant_client,
+                    collection_name=self.collection_name,
+                    embedding=self.embeddings
                 )
             
-            self.vector_store = QdrantVectorStore(
-                client=self.client,
-                collection_name=self.collection_name,
-                embedding=self.embeddings
-            )
         except Exception as e:
             self.logger.error_with_context(
-                "Failed to initialize vector store",
+                "Failed to initialize collection",
                 extra_attributes={
                     "qdrant.url": self.qdrant_url,
                     "collection.name": self.collection_name,
                     "error.type": type(e).__name__,
                     "error.message": str(e),
-                    "operation": "vector_store_init"
+                    "operation": "collection_init"
                 },
                 exc_info=True
             )
             raise
     
-    def add_documents(self, documents: List[Document], file_info: Dict) -> List[str]:
-        for doc in documents:
-            doc.metadata.update({
-                "file_id": file_info.get("file_id"),
-                "file_name": file_info.get("file_name"),
-                "processed_at": datetime.now().isoformat()
-            })
-        
-        point_ids = [
-            hashlib.md5(f"{file_info['file_path']}_{i}_{doc.page_content[:50]}".encode()).hexdigest()
-            for i, doc in enumerate(documents)
-        ]
-        
-        self.logger.info_with_context(
-            "Adding documents to vector store",
-            extra_attributes={
-                "file.id": file_info.get("file_id"),
-                "file.name": file_info.get("file_name"),
-                "documents.count": len(documents),
-                "vector_ids.generated": len(point_ids),
-                "operation": "vector_store_add"
-            }
-        )
-        
-        try:
-            self.vector_store.add_documents(documents, ids=point_ids)
-            
-            self.logger.info_with_context(
-                "Documents successfully added to vector store",
-                extra_attributes={
-                    "file.name": file_info.get("file_name"),
-                    "documents.added": len(documents),
-                    "operation": "vector_store_add",
-                    "status": "success"
-                }
-            )
-        except Exception as e:
-            self.logger.error_with_context(
-                "Failed to add documents to vector store",
-                extra_attributes={
-                    "file.name": file_info.get("file_name"),
-                    "documents.count": len(documents),
-                    "error.type": type(e).__name__,
-                    "error.message": str(e),
-                    "operation": "vector_store_add",
-                    "status": "failed"
-                },
-                exc_info=True
-            )
-            raise
-        
-        return point_ids
+    def process_documents(self, documents: List[Document], file_info: Dict) -> List[str]:
+        """Process documents and add to Qdrant with complete tracing"""
+        with self.tracer.start_as_current_span("process_documents") as span:
+            try:
+                span.set_attributes({
+                    "service.name": "document-rag-backend",
+                    "service.version": "2.0.0",
+                    "file_name": file_info.get("file_name", "unknown"),
+                    "document_count": len(documents),
+                    "file_source": file_info.get("source", "unknown"),
+                    "operation.name": "process_documents"
+                })
+                
+                if not documents:
+                    span.set_attribute("result", "no_documents")
+                    return []
+                
+                # Split documents into chunks using environment variables
+                chunk_size = int(os.getenv("CHUNK_SIZE", "3000"))
+                chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "300"))
+                
+                with self.tracer.start_as_current_span("document_splitting") as split_span:
+                    split_span.set_attributes({
+                        "service.name": "document-rag-backend",
+                        "operation.name": "document_splitting",
+                        "chunk_size": chunk_size,
+                        "chunk_overlap": chunk_overlap
+                    })
+                    chunks = split_documents(documents, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+                    split_span.set_attribute("chunks_created", len(chunks))
+                    
+                    self.logger.info_with_context(
+                        "Documents split into chunks",
+                        extra_attributes={
+                            "file.name": file_info.get("file_name"),
+                            "documents.original": len(documents),
+                            "chunks.created": len(chunks),
+                            "chunk.size": chunk_size,
+                            "chunk.overlap": chunk_overlap,
+                            "operation": "document_splitting"
+                        }
+                    )
+                
+                if not chunks:
+                    span.set_attribute("result", "no_chunks")
+                    return []
+                
+                # Add metadata with trace correlation
+                trace_id = span.get_span_context().trace_id
+                for chunk in chunks:
+                    chunk.metadata.update({
+                        "file_id": file_info.get("file_id", "unknown"),
+                        "file_name": file_info.get("file_name", "unknown"),
+                        "file_path": file_info.get("file_path", "unknown"),
+                        "processed_at": datetime.now().isoformat(),
+                        "file_size": file_info.get("file_size", 0),
+                        "mime_type": file_info.get("mime_type", "unknown"),
+                        "trace_id": format(trace_id, '032x'),
+                        "processing_service": "document-rag-backend"
+                    })
+                
+                # Generate embeddings and add to Qdrant
+                point_ids = []
+                batch_size = int(os.getenv("BATCH_SIZE", "5"))
+                
+                with self.tracer.start_as_current_span("embedding_generation") as embed_span:
+                    embed_span.set_attributes({
+                        "service.name": "document-rag-backend",
+                        "peer.service": "openai-api",
+                        "external.service.name": "openai-api",
+                        "external.service.type": "embedding_api",
+                        "ai.model.name": self.embedding_model,
+                        "batch_size": batch_size
+                    })
+                    
+                    for i in range(0, len(chunks), batch_size):
+                        batch = chunks[i:i + batch_size]
+                        
+                        with self.tracer.start_as_current_span("embedding_batch") as batch_span:
+                            batch_span.set_attributes({
+                                "service.name": "document-rag-backend",
+                                "batch_number": i//batch_size + 1,
+                                "batch_size": len(batch),
+                                "file_name": file_info.get("file_name", "unknown")
+                            })
+                            
+                            # Generate unique point IDs
+                            batch_point_ids = [
+                                hashlib.md5(f"{file_info['file_path']}_{i+j}_{chunk.page_content[:100]}".encode()).hexdigest()
+                                for j, chunk in enumerate(batch)
+                            ]
+                            
+                            # Add to vector store with Qdrant tracing
+                            with self.tracer.start_as_current_span("qdrant_store_documents") as qdrant_span:
+                                qdrant_span.set_attributes({
+                                    "service.name": "document-rag-backend",
+                                    "peer.service": "qdrant-database",
+                                    "external.service.name": "qdrant-database",
+                                    "external.service.type": "vector_database",
+                                    "db.system": "qdrant",
+                                    "db.operation": "add_documents",
+                                    "db.collection.name": self.collection_name,
+                                    "db.connection_string": self.qdrant_url
+                                })
+                                
+                                self.vector_store.add_documents(batch, ids=batch_point_ids)
+                                point_ids.extend(batch_point_ids)
+                                
+                                # Track external API call
+                                external_api_calls.add(1, {"service": "qdrant-database", "operation": "add_documents"})
+                            
+                            batch_span.set_attribute("points_created", len(batch_point_ids))
+                            
+                            self.logger.debug_with_context(
+                                "Processed embedding batch",
+                                extra_attributes={
+                                    "batch.number": i//batch_size + 1,
+                                    "batch.size": len(batch),
+                                    "points.created": len(batch_point_ids),
+                                    "operation": "embedding_batch"
+                                }
+                            )
+                            
+                            time.sleep(0.1)
+                
+                # Update metrics
+                documents_processed.add(len(chunks), {"source": file_info.get("source", "unknown")})
+                
+                span.set_attributes({
+                    "points_created": len(point_ids),
+                    "result": "success"
+                })
+                
+                self.logger.info_with_context(
+                    "Document processing completed successfully",
+                    extra_attributes={
+                        "file.name": file_info.get("file_name"),
+                        "chunks.processed": len(chunks),
+                        "points.created": len(point_ids),
+                        "operation": "process_documents",
+                        "status": "success"
+                    }
+                )
+                
+                return point_ids
+                
+            except Exception as e:
+                span.record_exception(e)
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                processing_errors.add(1, {"operation": "document_processing"})
+                
+                self.logger.error_with_context(
+                    "Document processing failed",
+                    extra_attributes={
+                        "file.name": file_info.get("file_name"),
+                        "error.type": type(e).__name__,
+                        "error.message": str(e),
+                        "operation": "process_documents",
+                        "status": "failed"
+                    },
+                    exc_info=True
+                )
+                raise
+
 
 class BackendService:
+    """Main backend service with complete trace correlation"""
+    
     def __init__(self):
         self.tracer = tracer
         self.service_name = "document-rag-backend"
         self.orchestrator_url = orchestrator_url
         
-        # Add correlated logger for the service
-        self.logger = get_correlated_logger(f"{__name__}.BackendService")
-        
+        # Configuration
         self.google_drive_folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-        self.local_watch_dirs = os.getenv("LOCAL_WATCH_DIRS", "").split(",") if os.getenv("LOCAL_WATCH_DIRS") else []
+        # Skip local files for now
+        # self.local_watch_dirs = os.getenv("LOCAL_WATCH_DIRS", "").split(",") if os.getenv("LOCAL_WATCH_DIRS") else []
+        self.local_watch_dirs = []  # Disabled for now
         self.scan_interval = int(os.getenv("SCAN_INTERVAL", "30"))
         
+        # Initialize components
         self.fingerprint_db = FileFingerprintDatabase()
-        self.document_processor = DocumentProcessor()
-        self.vector_store_manager = VectorStoreManager()
+        self.processor = DocumentProcessor()
+        self.google_drive_loader = None
         
+        # Service state
         self.is_running = False
         self.stats = {
             "service_started": datetime.now(),
             "files_processed": 0,
             "documents_created": 0,
-            "last_scan": None
+            "last_scan": None,
+            "errors": []
         }
         
-        self.google_drive_loader = None
+        # Add correlated logger for the service
+        self.logger = get_correlated_logger(f"{__name__}.BackendService")
+        
+        # Initialize Google Drive loader if configured
         if self.google_drive_folder_id:
             try:
+                credentials_path = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
+                token_path = os.getenv("GOOGLE_TOKEN_PATH", "token.json")
+                
                 self.google_drive_loader = GoogleDriveMasterLoader(
                     folder_id=self.google_drive_folder_id,
-                    credentials_path=os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json"),
-                    token_path=os.getenv("GOOGLE_TOKEN_PATH", "token.json"),
+                    credentials_path=credentials_path,
+                    token_path=token_path,
                     split=False
                 )
                 
@@ -340,7 +614,7 @@ class BackendService:
                     }
                 )
             except Exception as e:
-                self.logger.warning_with_context(
+                self.logger.error_with_context(
                     "Google Drive loader initialization failed",
                     extra_attributes={
                         "google_drive.folder_id": self.google_drive_folder_id,
@@ -349,6 +623,7 @@ class BackendService:
                         "operation": "service_init"
                     }
                 )
+                self.google_drive_loader = None
         
         self.logger.info_with_context(
             "Backend service initialized",
@@ -356,17 +631,713 @@ class BackendService:
                 "service.name": self.service_name,
                 "orchestrator.url": self.orchestrator_url,
                 "scan_interval": self.scan_interval,
-                "local_watch_dirs": len(self.local_watch_dirs),
+                "local_watch_dirs": 0,  # Disabled for now
                 "google_drive.enabled": self.google_drive_loader is not None,
                 "operation": "service_init"
             }
         )
-    
+
+    def calculate_file_hash(self, file_path: str) -> str:
+        """Calculate SHA-256 hash of a file"""
+        hash_sha256 = hashlib.sha256()
+        try:
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_sha256.update(chunk)
+            return hash_sha256.hexdigest()
+        except Exception as e:
+            self.logger.error_with_context(
+                "Failed to calculate file hash",
+                extra_attributes={
+                    "file.path": file_path,
+                    "error.type": type(e).__name__,
+                    "error.message": str(e),
+                    "operation": "file_hash"
+                }
+            )
+            return ""
+
+    def cleanup_extracted_images(self, documents: List[Document]):
+        """Clean up locally extracted images after processing"""
+        try:
+            image_paths_to_clean = set()
+            
+            for doc in documents:
+                img_path = doc.metadata.get("image_path")
+                if img_path and os.path.exists(img_path):
+                    image_paths_to_clean.add(img_path)
+                
+                related_images = doc.metadata.get("related_images", [])
+                for rel_img in related_images:
+                    if isinstance(rel_img, str) and os.path.exists(rel_img):
+                        image_paths_to_clean.add(rel_img)
+            
+            cleaned_count = 0
+            for img_path in image_paths_to_clean:
+                try:
+                    if any(dir_name in img_path for dir_name in ['pdf_images', 'pptx_images', 'docx_images']):
+                        os.remove(img_path)
+                        cleaned_count += 1
+                except OSError as e:
+                    self.logger.debug_with_context(
+                        "Could not remove image file",
+                        extra_attributes={
+                            "image.path": img_path,
+                            "error.message": str(e),
+                            "operation": "image_cleanup"
+                        }
+                    )
+            
+            if cleaned_count > 0:
+                self.logger.info_with_context(
+                    "Cleaned up extracted image files",
+                    extra_attributes={
+                        "images.cleaned": cleaned_count,
+                        "operation": "image_cleanup"
+                    }
+                )
+                
+        except Exception as e:
+            self.logger.warning_with_context(
+                "Error during image cleanup",
+                extra_attributes={
+                    "error.type": type(e).__name__,
+                    "error.message": str(e),
+                    "operation": "image_cleanup"
+                }
+            )
+
+    def scan_google_drive(self) -> List[Dict]:
+        """Scan Google Drive for new files with tracing"""
+        if not self.google_drive_loader:
+            self.logger.warning_with_context(
+                "Google Drive loader not available",
+                extra_attributes={
+                    "operation": "google_drive_scan"
+                }
+            )
+            return []
+        
+        new_files = []
+        try:
+            self.logger.info_with_context(
+                "Starting Google Drive scan",
+                extra_attributes={
+                    "google_drive.folder_id": self.google_drive_folder_id,
+                    "operation": "google_drive_scan"
+                }
+            )
+            
+            files = self.google_drive_loader._list_files(self.google_drive_folder_id)
+            
+            self.logger.info_with_context(
+                "Google Drive files listed",
+                extra_attributes={
+                    "files.total": len(files),
+                    "operation": "google_drive_scan"
+                }
+            )
+            
+            for file_info in files:
+                file_id = file_info["id"]
+                file_name = file_info["name"]
+                mime_type = file_info.get("mimeType", "unknown")
+                
+                # Skip Google Apps files that we can't process directly
+                if mime_type.startswith("application/vnd.google-apps.") and mime_type not in [
+                    "application/vnd.google-apps.document",
+                    "application/vnd.google-apps.spreadsheet", 
+                    "application/vnd.google-apps.presentation"
+                ]:
+                    continue
+                
+                file_path = f"gdrive://{file_id}/{file_name}"
+                file_hash = hashlib.md5(f"{file_id}_{file_name}_{mime_type}".encode()).hexdigest()
+                
+                if (self.fingerprint_db.is_file_processed(file_path, file_hash) or 
+                    self.fingerprint_db.is_file_in_qdrant(file_path, self.processor.qdrant_client)):
+                    self.logger.debug_with_context(
+                        "Skipping already processed Google Drive file",
+                        extra_attributes={
+                            "file.name": file_name,
+                            "file.id": file_id,
+                            "operation": "google_drive_scan"
+                        }
+                    )
+                    continue
+                
+                self.logger.info_with_context(
+                    "Found new Google Drive file",
+                    extra_attributes={
+                        "file.name": file_name,
+                        "file.type": mime_type,
+                        "file.id": file_id,
+                        "operation": "google_drive_scan"
+                    }
+                )
+                
+                new_files.append({
+                    "file_id": file_id,
+                    "file_name": file_name,
+                    "file_path": file_path,
+                    "file_hash": file_hash,
+                    "file_size": 0,
+                    "mime_type": mime_type,
+                    "source": "google_drive",
+                    "drive_file_info": file_info
+                })
+                
+        except Exception as e:
+            self.logger.error_with_context(
+                "Google Drive scan failed",
+                extra_attributes={
+                    "google_drive.folder_id": self.google_drive_folder_id,
+                    "error.type": type(e).__name__,
+                    "error.message": str(e),
+                    "operation": "google_drive_scan"
+                },
+                exc_info=True
+            )
+            self.stats["errors"].append(f"Google Drive scan error: {e}")
+        
+        return new_files
+
+    def scan_local_directories(self) -> List[Dict]:
+        """Scan local directories for new files"""
+        new_files = []
+        
+        for watch_dir in self.local_watch_dirs:
+            if not os.path.exists(watch_dir):
+                self.logger.warning_with_context(
+                    "Local watch directory does not exist",
+                    extra_attributes={
+                        "directory.path": watch_dir,
+                        "operation": "local_scan"
+                    }
+                )
+                continue
+            
+            try:
+                for root, _, files in os.walk(watch_dir):
+                    for file in files:
+                        if file.startswith('.'):
+                            continue
+                        
+                        file_path = os.path.join(root, file)
+                        try:
+                            file_hash = self.calculate_file_hash(file_path)
+                            if not file_hash:
+                                continue
+                                
+                            stat = os.stat(file_path)
+                            file_id = file_hash
+                            
+                            if self.fingerprint_db.is_file_processed(file_path, file_hash):
+                                continue
+                            
+                            new_files.append({
+                                "file_id": file_id,
+                                "file_name": file,
+                                "file_path": file_path,
+                                "file_hash": file_hash,
+                                "file_size": stat.st_size,
+                                "mime_type": f"application/{os.path.splitext(file)[1][1:]}",
+                                "source": "local"
+                            })
+                            
+                            self.logger.debug_with_context(
+                                "Found new local file",
+                                extra_attributes={
+                                    "file.name": file,
+                                    "file.path": file_path,
+                                    "file.size": stat.st_size,
+                                    "operation": "local_scan"
+                                }
+                            )
+                            
+                        except Exception as e:
+                            self.logger.debug_with_context(
+                                "Error processing local file",
+                                extra_attributes={
+                                    "file.path": file_path,
+                                    "error.message": str(e),
+                                    "operation": "local_scan"
+                                }
+                            )
+                            continue
+                            
+            except Exception as e:
+                self.logger.error_with_context(
+                    "Local directory scan failed",
+                    extra_attributes={
+                        "directory.path": watch_dir,
+                        "error.type": type(e).__name__,
+                        "error.message": str(e),
+                        "operation": "local_scan"
+                    }
+                )
+        
+        if new_files:
+            self.logger.info_with_context(
+                "Local directory scan completed",
+                extra_attributes={
+                    "files.found": len(new_files),
+                    "operation": "local_scan"
+                }
+            )
+        
+        return new_files
+
+    def scan_and_process(self):
+        """Enhanced scan and process with complete service correlation"""
+        with self.tracer.start_as_current_span("scan_and_process") as span:
+            try:
+                start_time = time.time()
+                
+                self.logger.info_with_context(
+                    "Starting scan cycle",
+                    extra_attributes={
+                        "operation": "scan_cycle"
+                    }
+                )
+                
+                # Set comprehensive service attributes for correlation
+                span.set_attributes({
+                    "service.name": "document-rag-backend",
+                    "service.version": "2.0.0",
+                    "service.namespace": "document-rag",
+                    "deployment.environment": os.getenv("OTEL_ENVIRONMENT", "production"),
+                    "operation.name": "scan_and_process",
+                    "scan.interval": self.scan_interval
+                })
+                
+                # Create trace correlation ID
+                trace_id = span.get_span_context().trace_id
+                correlation_id = format(trace_id, '032x')[:16]
+                
+                self.logger.info_with_context(
+                    "Scan cycle correlation established",
+                    extra_attributes={
+                        "correlation.id": correlation_id,
+                        "operation": "scan_cycle"
+                    }
+                )
+                
+                new_files = []
+                
+                # Scan Google Drive with correlation
+                with self.tracer.start_as_current_span("google_drive_scan") as gdrive_span:
+                    gdrive_span.set_attributes({
+                        "service.name": "document-rag-backend",
+                        "peer.service": "google-drive-api",
+                        "external.service.name": "google-drive-api",
+                        "external.service.type": "file_storage_api",
+                        "operation.name": "scan_files",
+                        "correlation.id": correlation_id
+                    })
+                    google_drive_files = self.scan_google_drive()
+                    gdrive_span.set_attribute("files_found", len(google_drive_files))
+                    new_files.extend(google_drive_files)
+                    
+                    # Track external API call
+                    if google_drive_files:
+                        external_api_calls.add(1, {"service": "google-drive-api", "operation": "list_files"})
+                
+                # Skip local directories scan for now
+                # with self.tracer.start_as_current_span("local_directories_scan") as local_span:
+                #     local_span.set_attributes({
+                #         "service.name": "document-rag-backend",
+                #         "operation.name": "scan_local_files",
+                #         "correlation.id": correlation_id
+                #     })
+                #     local_files = self.scan_local_directories()
+                #     local_span.set_attribute("files_found", len(local_files))
+                #     new_files.extend(local_files)
+                
+                self.stats["last_scan"] = datetime.now()
+                span.set_attribute("total_files_found", len(new_files))
+                
+                if not new_files:
+                    # Even when no files found, create spans to maintain service visibility
+                    with self.tracer.start_as_current_span("no_files_maintenance") as maintenance_span:
+                        maintenance_span.set_attributes({
+                            "service.name": "document-rag-backend",
+                            "maintenance.type": "periodic_keepalive",
+                            "scan.result": "no_new_files",
+                            "correlation.id": correlation_id
+                        })
+                        
+                        # Create minimal spans to external services to keep them visible
+                        with self.tracer.start_as_current_span("keepalive_qdrant_ping") as qdrant_ping:
+                            qdrant_ping.set_attributes({
+                                "service.name": "document-rag-backend",
+                                "peer.service": "qdrant-database",
+                                "external.service.name": "qdrant-database",
+                                "external.service.type": "vector_database",
+                                "db.system": "qdrant",
+                                "db.operation": "health_ping",
+                                "ping.purpose": "service_map_visibility"
+                            })
+                            
+                            try:
+                                # Quick health check to maintain Qdrant visibility
+                                collections = self.processor.qdrant_client.get_collections()
+                                qdrant_ping.set_attribute("qdrant.responsive", True)
+                                qdrant_ping.set_attribute("qdrant.collections_count", len(collections.collections))
+                            except Exception as ping_error:
+                                qdrant_ping.record_exception(ping_error)
+                                qdrant_ping.set_attribute("qdrant.responsive", False)
+                        
+                        # If Google Drive is configured, ping it too
+                        if self.google_drive_loader:
+                            with self.tracer.start_as_current_span("keepalive_gdrive_ping") as gdrive_ping:
+                                gdrive_ping.set_attributes({
+                                    "service.name": "document-rag-backend",
+                                    "peer.service": "google-drive-api",
+                                    "external.service.name": "google-drive-api",
+                                    "external.service.type": "file_storage_api",
+                                    "ping.purpose": "service_map_visibility"
+                                })
+                                
+                                self.logger.debug_with_context(
+                                    "Google Drive service keepalive ping",
+                                    extra_attributes={
+                                        "operation": "service_keepalive"
+                                    }
+                                )
+                    
+                    self.logger.info_with_context(
+                        "No new files found in scan cycle - service keepalive completed",
+                        extra_attributes={
+                            "correlation.id": correlation_id,
+                            "operation": "scan_cycle",
+                            "scan.result": "no_files",
+                            "keepalive.generated": True
+                        }
+                    )
+                    scan_duration.record(time.time() - start_time, {"result": "no_files"})
+                    return
+                
+                self.logger.info_with_context(
+                    "New files found for processing",
+                    extra_attributes={
+                        "files.count": len(new_files),
+                        "correlation.id": correlation_id,
+                        "operation": "scan_cycle"
+                    }
+                )
+                
+                for file_info in new_files:
+                    self.logger.info_with_context(
+                        "File queued for processing",
+                        extra_attributes={
+                            "file.name": file_info['file_name'],
+                            "file.source": file_info['source'],
+                            "operation": "scan_cycle"
+                        }
+                    )
+                
+                # Process each file with correlation
+                processed_count = 0
+                failed_count = 0
+                
+                for file_info in new_files:
+                    if not self.is_running:
+                        self.logger.info_with_context(
+                            "Service stopping, halting file processing",
+                            extra_attributes={
+                                "operation": "scan_cycle"
+                            }
+                        )
+                        break
+                    
+                    with self.tracer.start_as_current_span("process_single_file") as file_span:
+                        file_span.set_attributes({
+                            "service.name": "document-rag-backend",
+                            "service.version": "2.0.0",
+                            "file_name": file_info.get("file_name", "unknown"),
+                            "file_source": file_info.get("source", "unknown"),
+                            "file_type": file_info.get("mime_type", "unknown"),
+                            "correlation.id": correlation_id,
+                            "operation.name": "process_single_file"
+                        })
+                        
+                        try:
+                            self.logger.info_with_context(
+                                "Processing file",
+                                extra_attributes={
+                                    "file.name": file_info['file_name'],
+                                    "file.number": f"{processed_count + 1}/{len(new_files)}",
+                                    "operation": "file_processing"
+                                }
+                            )
+                            
+                            if self.process_file(file_info):
+                                processed_count += 1
+                                file_span.set_attribute("result", "success")
+                                
+                                self.logger.info_with_context(
+                                    "File processed successfully",
+                                    extra_attributes={
+                                        "file.name": file_info['file_name'],
+                                        "operation": "file_processing",
+                                        "status": "success"
+                                    }
+                                )
+                            else:
+                                failed_count += 1
+                                file_span.set_attribute("result", "failed")
+                                
+                                self.logger.warning_with_context(
+                                    "File processing failed",
+                                    extra_attributes={
+                                        "file.name": file_info['file_name'],
+                                        "operation": "file_processing",
+                                        "status": "failed"
+                                    }
+                                )
+                                
+                        except Exception as e:
+                            failed_count += 1
+                            file_span.record_exception(e)
+                            file_span.set_status(Status(StatusCode.ERROR, str(e)))
+                            processing_errors.add(1, {"operation": "file_processing"})
+                            
+                            self.logger.error_with_context(
+                                "File processing error",
+                                extra_attributes={
+                                    "file.name": file_info.get('file_name'),
+                                    "error.type": type(e).__name__,
+                                    "error.message": str(e),
+                                    "operation": "file_processing"
+                                },
+                                exc_info=True
+                            )
+                            continue
+                        
+                        time.sleep(2)
+                
+                # Record final metrics and correlation
+                duration = time.time() - start_time
+                scan_duration.record(duration, {"result": "completed"})
+                files_processed.add(processed_count, {"result": "success"})
+                files_processed.add(failed_count, {"result": "failed"})
+                
+                span.set_attributes({
+                    "processed_count": processed_count,
+                    "failed_count": failed_count,
+                    "scan_duration": duration,
+                    "correlation.id": correlation_id
+                })
+                
+                self.logger.info_with_context(
+                    "Scan cycle completed",
+                    extra_attributes={
+                        "files.processed": processed_count,
+                        "files.failed": failed_count,
+                        "scan.duration": duration,
+                        "correlation.id": correlation_id,
+                        "operation": "scan_cycle"
+                    }
+                )
+                
+            except Exception as e:
+                span.record_exception(e)
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                processing_errors.add(1, {"operation": "scan_cycle"})
+                
+                self.logger.error_with_context(
+                    "Scan cycle error",
+                    extra_attributes={
+                        "error.type": type(e).__name__,
+                        "error.message": str(e),
+                        "operation": "scan_cycle"
+                    },
+                    exc_info=True
+                )
+                self.stats["errors"].append(f"Scan cycle error: {e}")
+
+    def process_file(self, file_info: Dict) -> bool:
+        """Process a single file with complete correlation"""
+        with self.tracer.start_as_current_span("process_document_file") as span:
+            span.set_attributes({
+                "service.name": "document-rag-backend",
+                "service.version": "2.0.0",
+                "file_id": file_info.get("file_id", "unknown"),
+                "file_name": file_info.get("file_name", "unknown"),
+                "file_source": file_info.get("source", "unknown"),
+                "file_type": file_info.get("mime_type", "unknown"),
+                "operation.name": "process_document_file"
+            })
+            
+            try:
+                file_path = file_info["file_path"]
+                file_name = file_info["file_name"]
+                source = file_info["source"]
+                
+                self.logger.info_with_context(
+                    "Starting file processing",
+                    extra_attributes={
+                        "file.name": file_name,
+                        "file.source": source,
+                        "operation": "file_processing"
+                    }
+                )
+                
+                documents = []
+                temp_file = None
+                
+                if source == "local":
+                    with self.tracer.start_as_current_span("load_local_file") as load_span:
+                        load_span.set_attributes({
+                            "service.name": "document-rag-backend",
+                            "operation.name": "load_local_file"
+                        })
+                        documents = load_file(file_path)
+                        self.cleanup_extracted_images(documents)
+                        
+                elif source == "google_drive":
+                    with self.tracer.start_as_current_span("download_google_drive_file") as download_span:
+                        download_span.set_attributes({
+                            "service.name": "document-rag-backend",
+                            "peer.service": "google-drive-api",
+                            "external.service.name": "google-drive-api",
+                            "external.service.type": "file_download_api",
+                            "operation.name": "download_file"
+                        })
+                        drive_file_info = file_info["drive_file_info"]
+                        temp_file = self.google_drive_loader._download_file(drive_file_info)
+                        download_span.set_attribute("temp_file", temp_file)
+                        
+                        documents = load_file(temp_file)
+                        self.google_drive_loader._process_docs(documents, drive_file_info)
+                        
+                        if temp_file and os.path.exists(temp_file):
+                            file_info["file_size"] = os.path.getsize(temp_file)
+                        
+                        # Track external API call
+                        external_api_calls.add(1, {"service": "google-drive-api", "operation": "download_file"})
+                
+                if not documents:
+                    self.logger.warning_with_context(
+                        "No documents extracted from file",
+                        extra_attributes={
+                            "file.name": file_name,
+                            "operation": "file_processing"
+                        }
+                    )
+                    span.set_status(Status(StatusCode.ERROR, "No documents extracted"))
+                    return False
+                
+                self.logger.info_with_context(
+                    "Documents extracted from file",
+                    extra_attributes={
+                        "file.name": file_name,
+                        "documents.count": len(documents),
+                        "operation": "file_processing"
+                    }
+                )
+                span.set_attribute("documents_extracted", len(documents))
+                
+                # Process documents with correlation
+                point_ids = self.processor.process_documents(documents, file_info)
+                
+                # Mark as processed with trace correlation
+                with self.tracer.start_as_current_span("mark_file_processed") as mark_span:
+                    mark_span.set_attributes({
+                        "service.name": "document-rag-backend",
+                        "operation.name": "mark_file_processed"
+                    })
+                    processed_file = ProcessedFile(
+                        file_id=file_info["file_id"],
+                        file_name=file_name,
+                        file_path=file_path,
+                        file_hash=file_info["file_hash"],
+                        processed_at=datetime.now(),
+                        document_count=len(documents),
+                        file_size=file_info["file_size"],
+                        mime_type=file_info["mime_type"],
+                        qdrant_point_ids=point_ids
+                    )
+                    
+                    self.fingerprint_db.mark_file_processed(processed_file)
+                
+                # Update stats
+                self.stats["files_processed"] += 1
+                self.stats["documents_created"] += len(documents)
+                
+                # Clean up temporary file
+                if temp_file and os.path.exists(temp_file):
+                    with self.tracer.start_as_current_span("cleanup_temp_file"):
+                        try:
+                            os.remove(temp_file)
+                            self.logger.debug_with_context(
+                                "Cleaned up temporary file",
+                                extra_attributes={
+                                    "temp_file": os.path.basename(temp_file),
+                                    "operation": "file_processing"
+                                }
+                            )
+                        except Exception as e:
+                            self.logger.debug_with_context(
+                                "Could not remove temporary file",
+                                extra_attributes={
+                                    "temp_file": temp_file,
+                                    "error.message": str(e),
+                                    "operation": "file_processing"
+                                }
+                            )
+                
+                if source == "local":
+                    self.cleanup_extracted_images(documents)
+                
+                span.set_attributes({
+                    "result": "success",
+                    "points_created": len(point_ids)
+                })
+                
+                self.logger.info_with_context(
+                    "File processing completed successfully",
+                    extra_attributes={
+                        "file.name": file_name,
+                        "documents.count": len(documents),
+                        "points.created": len(point_ids),
+                        "operation": "file_processing",
+                        "status": "success"
+                    }
+                )
+                
+                return True
+                
+            except Exception as e:
+                span.record_exception(e)
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                
+                self.logger.error_with_context(
+                    "File processing failed",
+                    extra_attributes={
+                        "file.name": file_info.get('file_name', 'unknown'),
+                        "error.type": type(e).__name__,
+                        "error.message": str(e),
+                        "operation": "file_processing"
+                    },
+                    exc_info=True
+                )
+                self.stats["errors"].append(f"File processing error: {e}")
+                return False
+
     async def send_heartbeat(self):
         """Send heartbeat with logging"""
         try:
             async with TracedHTTPXClient(service_name="document-rag-backend") as client:
                 with self.tracer.start_as_current_span("send_heartbeat") as span:
+                    span.set_attributes({
+                        "service.name": "document-rag-backend",
+                        "peer.service": "document-rag-orchestrator",
+                        "external.service.name": "document-rag-orchestrator",
+                        "external.service.type": "orchestrator_api",
+                        "operation.name": "send_heartbeat"
+                    })
                     response = await client.post(
                         f"{self.orchestrator_url}/heartbeat",
                         json={
@@ -381,6 +1352,7 @@ class BackendService:
                     )
                     
                     span.set_attribute("heartbeat.sent", True)
+                    span.set_attribute("response.status_code", response.status_code)
                     
                     self.logger.debug_with_context(
                         "Heartbeat sent to orchestrator",
@@ -406,12 +1378,19 @@ class BackendService:
                 },
                 exc_info=True
             )
-    
+
     async def check_orchestrator_health(self):
         """Check orchestrator health"""
         try:
             async with TracedHTTPXClient(service_name="document-rag-backend") as client:
                 with self.tracer.start_as_current_span("check_orchestrator") as span:
+                    span.set_attributes({
+                        "service.name": "document-rag-backend",
+                        "peer.service": "document-rag-orchestrator",
+                        "external.service.name": "document-rag-orchestrator",
+                        "external.service.type": "orchestrator_api",
+                        "operation.name": "health_check"
+                    })
                     response = await client.get(
                         f"{self.orchestrator_url}/health",
                         timeout=5.0
@@ -419,6 +1398,7 @@ class BackendService:
                     
                     is_healthy = response.status_code == 200
                     span.set_attribute("orchestrator.healthy", is_healthy)
+                    span.set_attribute("response.status_code", response.status_code)
                     
                     self.logger.info_with_context(
                         "Orchestrator health check completed",
@@ -443,331 +1423,262 @@ class BackendService:
                 exc_info=True
             )
             return False
-    
-    def scan_for_new_files(self) -> List[Dict]:
-        with self.tracer.start_as_current_span("scan_for_new_files") as span:
-            all_files = []
+
+    async def start_monitoring(self):
+        """Start the continuous monitoring service with correlation"""
+        with self.tracer.start_as_current_span("start_monitoring_service") as span:
+            self.is_running = True
+            span.set_attributes({
+                "service.name": "document-rag-backend",
+                "service.version": "2.0.0",
+                "scan_interval": self.scan_interval,
+                "operation.name": "start_monitoring"
+            })
             
             self.logger.info_with_context(
-                "Starting file scan",
+                "Starting monitoring loop",
                 extra_attributes={
-                    "google_drive.enabled": self.google_drive_loader is not None,
-                    "local_dirs.count": len(self.local_watch_dirs),
-                    "operation": "file_scan"
+                    "scan_interval": self.scan_interval,
+                    "operation": "monitoring_start"
                 }
             )
             
-            if self.google_drive_loader:
+            # Create initial spans to establish service in Kibana immediately
+            with self.tracer.start_as_current_span("backend_service_initialization") as init_span:
+                init_span.set_attributes({
+                    "service.name": "document-rag-backend",
+                    "service.version": "2.0.0",
+                    "service.namespace": "document-rag-system",
+                    "operation.name": "service_initialization",
+                    "initialization.timestamp": datetime.now().isoformat()
+                })
+                
+                # Force immediate span export to establish service in Kibana
                 try:
-                    files = self.google_drive_loader._list_files(self.google_drive_folder_id)
-                    for file_info in files:
-                        file_path = f"gdrive://{file_info['id']}/{file_info['name']}"
-                        file_hash = hashlib.md5(f"{file_info['id']}_{file_info['name']}".encode()).hexdigest()
-                        all_files.append({
-                            "file_id": file_info["id"],
-                            "file_name": file_info["name"],
-                            "file_path": file_path,
-                            "file_hash": file_hash,
-                            "file_size": 0,
-                            "mime_type": file_info.get("mimeType", "unknown"),
-                            "source": "google_drive",
-                            "drive_file_info": file_info
-                        })
+                    import time
+                    time.sleep(1)  # Give initialization span time to be processed
                     
-                    self.logger.info_with_context(
-                        "Google Drive scan completed",
-                        extra_attributes={
-                            "google_drive.files_found": len(files),
-                            "operation": "file_scan"
-                        }
-                    )
-                except Exception as e:
+                    # Create spans for each component to establish service topology
+                    with self.tracer.start_as_current_span("initialize_qdrant_connection") as qdrant_init_span:
+                        qdrant_init_span.set_attributes({
+                            "service.name": "document-rag-backend",
+                            "peer.service": "qdrant-database",
+                            "external.service.name": "qdrant-database",
+                            "external.service.type": "vector_database",
+                            "db.system": "qdrant",
+                            "db.operation": "health_check",
+                            "initialization.component": "vector_store"
+                        })
+                        
+                        # Actually test Qdrant connection
+                        try:
+                            collections = self.processor.qdrant_client.get_collections()
+                            qdrant_init_span.set_attribute("qdrant.collections_count", len(collections.collections))
+                            self.logger.info_with_context(
+                                "Qdrant connection verified during initialization",
+                                extra_attributes={
+                                    "qdrant.collections": len(collections.collections),
+                                    "operation": "service_initialization"
+                                }
+                            )
+                        except Exception as e:
+                            qdrant_init_span.record_exception(e)
+                            self.logger.warning_with_context(
+                                "Qdrant connection check failed during initialization",
+                                extra_attributes={
+                                    "error.message": str(e),
+                                    "operation": "service_initialization"
+                                }
+                            )
+                    
+                    # Initialize Google Drive connection span
+                    if self.google_drive_loader:
+                        with self.tracer.start_as_current_span("initialize_google_drive_connection") as gdrive_init_span:
+                            gdrive_init_span.set_attributes({
+                                "service.name": "document-rag-backend",
+                                "peer.service": "google-drive-api",
+                                "external.service.name": "google-drive-api",
+                                "external.service.type": "file_storage_api",
+                                "initialization.component": "google_drive_loader"
+                            })
+                            
+                            self.logger.info_with_context(
+                                "Google Drive loader initialized",
+                                extra_attributes={
+                                    "google_drive.folder_id": self.google_drive_folder_id,
+                                    "operation": "service_initialization"
+                                }
+                            )
+                    
+                    # Test OpenAI connection
+                    with self.tracer.start_as_current_span("initialize_openai_connection") as openai_init_span:
+                        openai_init_span.set_attributes({
+                            "service.name": "document-rag-backend",
+                            "peer.service": "openai-api",
+                            "external.service.name": "openai-api",
+                            "external.service.type": "embedding_api",
+                            "ai.model.name": self.processor.embedding_model,
+                            "initialization.component": "embedding_service"
+                        })
+                        
+                        self.logger.info_with_context(
+                            "OpenAI embeddings service initialized",
+                            extra_attributes={
+                                "ai.model": self.processor.embedding_model,
+                                "operation": "service_initialization"
+                            }
+                        )
+                
+                except Exception as init_error:
+                    init_span.record_exception(init_error)
                     self.logger.error_with_context(
-                        "Google Drive scan failed",
+                        "Service initialization encountered errors",
                         extra_attributes={
-                            "google_drive.folder_id": self.google_drive_folder_id,
-                            "error.type": type(e).__name__,
-                            "error.message": str(e),
-                            "operation": "file_scan"
+                            "error.type": type(init_error).__name__,
+                            "error.message": str(init_error),
+                            "operation": "service_initialization"
                         },
                         exc_info=True
                     )
             
-            local_files_count = 0
-            for watch_dir in self.local_watch_dirs:
-                if os.path.exists(watch_dir):
-                    for root, _, files in os.walk(watch_dir):
-                        for file in files:
-                            if file.startswith('.'):
-                                continue
+            # Start heartbeat task
+            heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+            
+            # Main monitoring loop - ALWAYS generate traces
+            loop_count = 0
+            while self.is_running:
+                try:
+                    # Create a span for each monitoring cycle to keep service visible
+                    with self.tracer.start_as_current_span("monitoring_cycle") as cycle_span:
+                        loop_count += 1
+                        cycle_span.set_attributes({
+                            "service.name": "document-rag-backend",
+                            "service.version": "2.0.0",
+                            "monitoring.cycle_number": loop_count,
+                            "monitoring.uptime_seconds": (datetime.now() - self.stats["service_started"]).total_seconds(),
+                            "operation.name": "monitoring_cycle"
+                        })
+                        
+                        # Always generate a background activity span
+                        with self.tracer.start_as_current_span("background_activity") as activity_span:
+                            activity_span.set_attributes({
+                                "service.name": "document-rag-backend",
+                                "activity.type": "background_monitoring",
+                                "cycle.number": loop_count
+                            })
                             
-                            file_path = os.path.join(root, file)
-                            try:
-                                file_hash = hashlib.sha256(open(file_path, 'rb').read()).hexdigest()
-                                stat = os.stat(file_path)
-                                all_files.append({
-                                    "file_id": file_hash,
-                                    "file_name": file,
-                                    "file_path": file_path,
-                                    "file_hash": file_hash,
-                                    "file_size": stat.st_size,
-                                    "mime_type": f"application/{os.path.splitext(file)[1][1:]}",
-                                    "source": "local"
+                            self.logger.debug_with_context(
+                                "Background monitoring cycle",
+                                extra_attributes={
+                                    "cycle.number": loop_count,
+                                    "service.uptime_seconds": (datetime.now() - self.stats["service_started"]).total_seconds(),
+                                    "operation": "monitoring_cycle"
+                                }
+                            )
+                        
+                        # Perform the actual scan and process
+                        self.scan_and_process()
+                        
+                        cycle_span.set_attribute("cycle.completed", True)
+                    
+                    # Sleep with periodic keep-alive spans
+                    for sleep_iteration in range(self.scan_interval):
+                        if not self.is_running:
+                            break
+                        
+                        # Generate a keep-alive span every 10 seconds during sleep
+                        if sleep_iteration % 10 == 0:
+                            with self.tracer.start_as_current_span("service_keepalive") as keepalive_span:
+                                keepalive_span.set_attributes({
+                                    "service.name": "document-rag-backend",
+                                    "service.status": "idle_monitoring",
+                                    "keepalive.iteration": sleep_iteration,
+                                    "next_scan_in_seconds": self.scan_interval - sleep_iteration
                                 })
-                                local_files_count += 1
-                            except Exception:
-                                continue
+                        
+                        await asyncio.sleep(1)
+                        
+                except Exception as e:
+                    # Always create error spans to maintain visibility
+                    with self.tracer.start_as_current_span("monitoring_error") as error_span:
+                        error_span.set_attributes({
+                            "service.name": "document-rag-backend",
+                            "error.in_monitoring": True,
+                            "monitoring.cycle_number": loop_count
+                        })
+                        error_span.record_exception(e)
+                        
+                        self.logger.error_with_context(
+                            "Monitoring error",
+                            extra_attributes={
+                                "error.type": type(e).__name__,
+                                "error.message": str(e),
+                                "cycle.number": loop_count,
+                                "operation": "monitoring_loop"
+                            },
+                            exc_info=True
+                        )
+                        
+                        self.stats["errors"].append(f"Monitoring loop error: {e}")
+                        processing_errors.add(1, {"operation": "monitoring_loop"})
+                        await asyncio.sleep(10)
             
-            if local_files_count > 0:
+            heartbeat_task.cancel()
+            
+            # Create shutdown span
+            with self.tracer.start_as_current_span("service_shutdown") as shutdown_span:
+                shutdown_span.set_attributes({
+                    "service.name": "document-rag-backend",
+                    "shutdown.reason": "monitoring_stopped",
+                    "service.total_cycles": loop_count,
+                    "service.uptime_seconds": (datetime.now() - self.stats["service_started"]).total_seconds()
+                })
+                
                 self.logger.info_with_context(
-                    "Local directory scan completed",
+                    "Monitoring loop stopped",
                     extra_attributes={
-                        "local.files_found": local_files_count,
-                        "operation": "file_scan"
+                        "total_cycles": loop_count,
+                        "operation": "monitoring_stop"
                     }
                 )
-            
-            new_files = [
-                f for f in all_files 
-                if not self.fingerprint_db.is_file_processed(f["file_path"], f["file_hash"])
-            ]
-            
-            span.set_attributes({
-                "scan.total_files": len(all_files),
-                "scan.new_files": len(new_files)
-            })
-            
-            self.logger.info_with_context(
-                "File scan completed",
-                extra_attributes={
-                    "scan.total_files": len(all_files),
-                    "scan.new_files": len(new_files),
-                    "scan.already_processed": len(all_files) - len(new_files),
-                    "operation": "file_scan"
-                }
-            )
-            
-            return new_files
-    
-    def process_single_file(self, file_info: Dict) -> bool:
-        with self.tracer.start_as_current_span("process_single_file") as span:
-            # Add structured logging with automatic correlation
-            self.logger.info_with_context(
-                "Starting file processing",
-                extra_attributes={
-                    "file.name": file_info["file_name"],
-                    "file.size": file_info["file_size"],
-                    "file.source": file_info["source"],
-                    "operation": "file_processing"
-                }
-            )
-            
-            try:
-                if file_info["source"] == "google_drive":
-                    temp_file = self.google_drive_loader._download_file(file_info["drive_file_info"])
-                    file_path = temp_file
-                    
-                    self.logger.debug_with_context(
-                        "Downloaded file from Google Drive",
-                        extra_attributes={
-                            "temp_file_path": temp_file,
-                            "drive_file_id": file_info["drive_file_info"]["id"],
-                            "operation": "file_processing"
-                        }
-                    )
-                else:
-                    file_path = file_info["file_path"]
-                
-                documents = self.document_processor.process_file(file_path, file_info)
-                if not documents:
-                    self.logger.warning_with_context(
-                        "No documents extracted from file",
-                        extra_attributes={
-                            "file.name": file_info["file_name"],
-                            "file.path": file_path,
-                            "operation": "file_processing"
-                        }
-                    )
-                    return False
-                
-                chunks = split_documents(documents, chunk_size=1000, chunk_overlap=120)
-                self.vector_store_manager.add_documents(chunks, file_info)
-                
-                # Log success with metrics
-                self.logger.info_with_context(
-                    "File processing completed successfully",
-                    extra_attributes={
-                        "file.name": file_info["file_name"],
-                        "documents.count": len(documents),
-                        "chunks.count": len(chunks),
-                        "processing.status": "success",
-                        "operation": "file_processing"
-                    }
-                )
-                
-                processed_file = ProcessedFile(
-                    file_id=file_info["file_id"],
-                    file_name=file_info["file_name"],
-                    file_path=file_info["file_path"],
-                    file_hash=file_info["file_hash"],
-                    processed_at=datetime.now(),
-                    document_count=len(documents),
-                    file_size=file_info["file_size"],
-                    mime_type=file_info["mime_type"]
-                )
-                
-                self.fingerprint_db.mark_file_processed(processed_file)
-                
-                if file_info["source"] == "google_drive" and os.path.exists(file_path):
-                    os.remove(file_path)
-                    self.logger.debug_with_context(
-                        "Cleaned up temporary Google Drive file",
-                        extra_attributes={
-                            "temp_file_path": file_path,
-                            "operation": "file_processing"
-                        }
-                    )
-                
-                # Update stats and mark as processed
-                self.stats["files_processed"] += 1
-                self.stats["documents_created"] += len(documents)
-                
-                return True
-                
-            except Exception as e:
-                span.record_exception(e)
-                
-                # Structured error logging
-                self.logger.error_with_context(
-                    "File processing failed",
-                    extra_attributes={
-                        "file.name": file_info["file_name"],
-                        "file.path": file_info.get("file_path", "unknown"),
-                        "error.type": type(e).__name__,
-                        "error.message": str(e),
-                        "operation": "file_processing",
-                        "processing.status": "failed"
-                    },
-                    exc_info=True  # Include full stack trace
-                )
-                return False
-    
-    async def scan_and_process_cycle(self):
-        self.logger.info_with_context(
-            "Starting scan and process cycle",
-            extra_attributes={
-                "operation": "scan_cycle"
-            }
-        )
-        
-        try:
-            new_files = self.scan_for_new_files()
-            self.stats["last_scan"] = datetime.now()
-            
-            if not new_files:
-                self.logger.debug_with_context(
-                    "No new files found in scan cycle",
-                    extra_attributes={
-                        "operation": "scan_cycle"
-                    }
-                )
-                return
-            
-            self.logger.info_with_context(
-                "Processing new files found in scan",
-                extra_attributes={
-                    "files.new_count": len(new_files),
-                    "operation": "scan_cycle"
-                }
-            )
-            
-            processed_count = 0
-            failed_count = 0
-            
-            for file_info in new_files:
-                if not self.is_running:
-                    break
-                
-                success = self.process_single_file(file_info)
-                if success:
-                    processed_count += 1
-                else:
-                    failed_count += 1
-                
-                await asyncio.sleep(1)
-            
-            self.logger.info_with_context(
-                "Scan and process cycle completed",
-                extra_attributes={
-                    "files.processed": processed_count,
-                    "files.failed": failed_count,
-                    "files.total": len(new_files),
-                    "operation": "scan_cycle"
-                }
-            )
-                
-        except Exception as e:
-            self.logger.error_with_context(
-                "Scan cycle error",
-                extra_attributes={
-                    "error.type": type(e).__name__,
-                    "error.message": str(e),
-                    "operation": "scan_cycle"
-                },
-                exc_info=True
-            )
-    
-    async def start_monitoring(self):
-        self.is_running = True
-        
-        self.logger.info_with_context(
-            "Starting monitoring loop",
-            extra_attributes={
-                "scan_interval": self.scan_interval,
-                "operation": "monitoring_start"
-            }
-        )
-        
-        # Start heartbeat task
-        heartbeat_task = asyncio.create_task(self.heartbeat_loop())
-        
-        while self.is_running:
-            try:
-                await self.scan_and_process_cycle()
-                
-                for _ in range(self.scan_interval):
-                    if not self.is_running:
-                        break
-                    await asyncio.sleep(1)
-                    
-            except Exception as e:
-                self.logger.error_with_context(
-                    "Monitoring error",
-                    extra_attributes={
-                        "error.type": type(e).__name__,
-                        "error.message": str(e),
-                        "operation": "monitoring_loop"
-                    },
-                    exc_info=True
-                )
-                await asyncio.sleep(10)
-        
-        heartbeat_task.cancel()
-        
-        self.logger.info_with_context(
-            "Monitoring loop stopped",
-            extra_attributes={
-                "operation": "monitoring_stop"
-            }
-        )
-    
+
     async def heartbeat_loop(self):
-        """Send periodic heartbeats to orchestrator"""
+        """Send periodic heartbeats to orchestrator - ALWAYS generate spans"""
+        heartbeat_count = 0
         while self.is_running:
-            await self.send_heartbeat()
+            heartbeat_count += 1
+            
+            # Create heartbeat span to maintain service visibility
+            with self.tracer.start_as_current_span("heartbeat_cycle") as heartbeat_span:
+                heartbeat_span.set_attributes({
+                    "service.name": "document-rag-backend",
+                    "heartbeat.number": heartbeat_count,
+                    "heartbeat.target": "document-rag-orchestrator",
+                    "operation.name": "heartbeat"
+                })
+                
+                try:
+                    await self.send_heartbeat()
+                    heartbeat_span.set_attribute("heartbeat.sent", True)
+                except Exception as e:
+                    heartbeat_span.record_exception(e)
+                    heartbeat_span.set_attribute("heartbeat.failed", True)
+                
+                # Log periodic heartbeat for visibility
+                if heartbeat_count % 12 == 0:  # Every 6 minutes (12 * 30 seconds)
+                    self.logger.info_with_context(
+                        "Periodic heartbeat status",
+                        extra_attributes={
+                            "heartbeat.count": heartbeat_count,
+                            "service.uptime_minutes": (datetime.now() - self.stats["service_started"]).total_seconds() / 60,
+                            "operation": "heartbeat_status"
+                        }
+                    )
+            
             await asyncio.sleep(30)
-    
+
     def stop_monitoring(self):
+        """Stop the monitoring service"""
         self.is_running = False
         
         self.logger.info_with_context(
@@ -776,56 +1687,397 @@ class BackendService:
                 "operation": "monitoring_stop"
             }
         )
-    
-    def get_service_status(self) -> Dict:
+
+    def get_status(self) -> Dict:
+        """Get service status with trace correlation"""
+        db_stats = self.fingerprint_db.get_stats()
+        recent_files = self.fingerprint_db.get_processed_files(limit=5)
+        
+        # Add trace context to status
+        current_span = trace.get_current_span()
+        trace_info = {}
+        if current_span != trace.INVALID_SPAN:
+            span_context = current_span.get_span_context()
+            trace_info = {
+                "trace_id": format(span_context.trace_id, '032x'),
+                "span_id": format(span_context.span_id, '016x')
+            }
+        
         return {
             "service": {
-                "name": self.service_name,
+                "name": "document-rag-backend",
+                "version": "2.0.0",
                 "is_running": self.is_running,
-                "parent": parent_service,
-                "orchestrator_url": self.orchestrator_url,
                 "started_at": self.stats["service_started"].isoformat(),
-                "uptime_seconds": (datetime.now() - self.stats["service_started"]).total_seconds()
+                "uptime_seconds": (datetime.now() - self.stats["service_started"]).total_seconds(),
+                "last_scan": self.stats["last_scan"].isoformat() if self.stats["last_scan"] else None,
+                "scan_interval": self.scan_interval,
+                "parent": parent_service,
+                "orchestrator_url": self.orchestrator_url
             },
             "processing": {
-                "files_processed": self.stats["files_processed"],
-                "documents_created": self.stats["documents_created"],
-                "last_scan": self.stats["last_scan"].isoformat() if self.stats["last_scan"] else None
-            }
+                "files_processed_session": self.stats["files_processed"],
+                "documents_created_session": self.stats["documents_created"],
+                "total_files_processed": db_stats["total_files"],
+                "total_documents_created": db_stats["total_documents"],
+                "total_size_bytes": db_stats["total_size_bytes"],
+                "last_processed": db_stats["last_processed"]
+            },
+            "configuration": {
+                "google_drive_folder_id": self.google_drive_folder_id,
+                "local_watch_dirs": [],  # Disabled for now
+                "qdrant_url": self.processor.qdrant_url,
+                "collection_name": self.processor.collection_name,
+                "embedding_model": self.processor.embedding_model,
+                "chunk_size": int(os.getenv("CHUNK_SIZE", "3000")),
+                "chunk_overlap": int(os.getenv("CHUNK_OVERLAP", "300")),
+                "batch_size": int(os.getenv("BATCH_SIZE", "5"))
+            },
+            "recent_files": [
+                {
+                    "file_name": f.file_name,
+                    "processed_at": f.processed_at.isoformat(),
+                    "document_count": f.document_count,
+                    "file_size": f.file_size
+                }
+                for f in recent_files
+            ],
+            "errors": self.stats["errors"][-10:],
+            "trace_context": trace_info
         }
 
-service_instance = None
+
+# Global service instance
+service = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global service_instance
+    """FastAPI lifespan management with OpenTelemetry correlation"""
+    global service
     
-    try:
-        service_instance = BackendService()
+    # Startup with immediate trace generation
+    with tracer.start_as_current_span("backend_service_startup") as startup_span:
+        startup_span.set_attributes({
+            "service.name": "document-rag-backend",
+            "service.version": "2.0.0",
+            "service.namespace": "document-rag-system",
+            "lifecycle.phase": "startup",
+            "startup.timestamp": datetime.now().isoformat()
+        })
         
-        # Check orchestrator on startup
-        await service_instance.check_orchestrator_health()
+        logger.info_with_context(
+            "Starting Backend Service",
+            extra_attributes={
+                "operation": "service_startup"
+            }
+        )
         
-        monitoring_task = asyncio.create_task(service_instance.start_monitoring())
+        try:
+            # Initialize service with trace visibility
+            with tracer.start_as_current_span("create_backend_service") as create_span:
+                create_span.set_attributes({
+                    "service.name": "document-rag-backend",
+                    "operation.name": "service_creation"
+                })
+                
+                service = BackendService()
+                create_span.set_attribute("service.initialized", True)
+            
+            # Check orchestrator health with proper spans
+            with tracer.start_as_current_span("startup_health_checks") as health_span:
+                health_span.set_attributes({
+                    "service.name": "document-rag-backend",
+                    "operation.name": "startup_health_checks"
+                })
+                
+                try:
+                    orchestrator_healthy = await service.check_orchestrator_health()
+                    health_span.set_attribute("orchestrator.healthy", orchestrator_healthy)
+                    
+                    # Test Qdrant during startup
+                    with tracer.start_as_current_span("startup_qdrant_test") as qdrant_test_span:
+                        qdrant_test_span.set_attributes({
+                            "service.name": "document-rag-backend",
+                            "peer.service": "qdrant-database",
+                            "external.service.name": "qdrant-database",
+                            "external.service.type": "vector_database",
+                            "db.system": "qdrant",
+                            "test.phase": "startup"
+                        })
+                        
+                        try:
+                            collections = service.processor.qdrant_client.get_collections()
+                            qdrant_test_span.set_attribute("qdrant.available", True)
+                            qdrant_test_span.set_attribute("qdrant.collections_count", len(collections.collections))
+                            
+                            logger.info_with_context(
+                                "Qdrant connection verified at startup",
+                                extra_attributes={
+                                    "qdrant.collections": len(collections.collections),
+                                    "operation": "startup_health_check"
+                                }
+                            )
+                        except Exception as qdrant_error:
+                            qdrant_test_span.record_exception(qdrant_error)
+                            qdrant_test_span.set_attribute("qdrant.available", False)
+                            logger.warning_with_context(
+                                "Qdrant connection issue at startup",
+                                extra_attributes={
+                                    "error.message": str(qdrant_error),
+                                    "operation": "startup_health_check"
+                                }
+                            )
+                    
+                    # Test Google Drive during startup if available
+                    if service.google_drive_loader:
+                        with tracer.start_as_current_span("startup_gdrive_test") as gdrive_test_span:
+                            gdrive_test_span.set_attributes({
+                                "service.name": "document-rag-backend",
+                                "peer.service": "google-drive-api",
+                                "external.service.name": "google-drive-api",
+                                "external.service.type": "file_storage_api",
+                                "test.phase": "startup"
+                            })
+                            
+                            logger.info_with_context(
+                                "Google Drive loader ready",
+                                extra_attributes={
+                                    "google_drive.folder_id": service.google_drive_folder_id,
+                                    "operation": "startup_health_check"
+                                }
+                            )
+                
+                except Exception as health_error:
+                    health_span.record_exception(health_error)
+                    logger.error_with_context(
+                        "Health checks failed during startup",
+                        extra_attributes={
+                            "error.type": type(health_error).__name__,
+                            "error.message": str(health_error),
+                            "operation": "startup_health_check"
+                        },
+                        exc_info=True
+                    )
+            
+            # Start monitoring task with immediate span generation
+            with tracer.start_as_current_span("start_monitoring_task") as monitor_span:
+                monitor_span.set_attributes({
+                    "service.name": "document-rag-backend",
+                    "operation.name": "start_monitoring_task"
+                })
+                
+                monitoring_task = asyncio.create_task(service.start_monitoring())
+                monitor_span.set_attribute("monitoring_task.started", True)
+                
+                # Perform an initial scan to generate immediate traces to external services
+                with tracer.start_as_current_span("startup_initial_scan") as scan_span:
+                    scan_span.set_attributes({
+                        "service.name": "document-rag-backend",
+                        "operation.name": "startup_initial_scan",
+                        "scan.purpose": "establish_service_map"
+                    })
+                    
+                    logger.info_with_context(
+                        "Performing initial scan to establish service map",
+                        extra_attributes={
+                            "operation": "startup_initial_scan"
+                        }
+                    )
+                    
+                    try:
+                        # Run one scan cycle immediately to establish external service connections
+                        await asyncio.to_thread(service.scan_and_process)
+                        scan_span.set_attribute("initial_scan.completed", True)
+                        
+                        logger.info_with_context(
+                            "Initial scan completed - service map should be visible",
+                            extra_attributes={
+                                "operation": "startup_initial_scan",
+                                "status": "completed"
+                            }
+                        )
+                    except Exception as scan_error:
+                        scan_span.record_exception(scan_error)
+                        logger.warning_with_context(
+                            "Initial scan encountered issues",
+                            extra_attributes={
+                                "error.type": type(scan_error).__name__,
+                                "error.message": str(scan_error),
+                                "operation": "startup_initial_scan"
+                            }
+                        )
+                
+                # Force export of spans to ensure immediate visibility in Kibana
+                with tracer.start_as_current_span("force_span_export") as export_span:
+                    export_span.set_attributes({
+                        "service.name": "document-rag-backend",
+                        "operation.name": "force_span_export",
+                        "export.purpose": "immediate_kibana_visibility"
+                    })
+                    
+                    try:
+                        # Force flush spans to OTEL collector
+                        from opentelemetry.sdk.trace import TracerProvider
+                        from opentelemetry import trace as otel_trace
+                        
+                        tracer_provider = otel_trace.get_tracer_provider()
+                        if hasattr(tracer_provider, '_active_span_processor'):
+                            tracer_provider._active_span_processor.force_flush(timeout_millis=5000)
+                            export_span.set_attribute("spans.force_flushed", True)
+                            
+                            logger.info_with_context(
+                                "OpenTelemetry spans force-flushed to collector",
+                                extra_attributes={
+                                    "operation": "span_export",
+                                    "purpose": "kibana_visibility"
+                                }
+                            )
+                        else:
+                            export_span.set_attribute("spans.force_flushed", False)
+                            logger.warning_with_context(
+                                "Could not force flush spans - using default export timing",
+                                extra_attributes={
+                                    "operation": "span_export"
+                                }
+                            )
+                    except Exception as export_error:
+                        export_span.record_exception(export_error)
+                        logger.warning_with_context(
+                            "Error during span force flush",
+                            extra_attributes={
+                                "error.type": type(export_error).__name__,
+                                "error.message": str(export_error),
+                                "operation": "span_export"
+                            }
+                        )
+                
+                # Give the monitoring task time to generate initial spans
+                await asyncio.sleep(3)
+                
+                logger.info_with_context(
+                    "Backend service startup completed",
+                    extra_attributes={
+                        "operation": "service_startup",
+                        "status": "completed"
+                    }
+                )
         
-        yield
+        except Exception as startup_error:
+            startup_span.record_exception(startup_error)
+            startup_span.set_attribute("startup.failed", True)
+            logger.error_with_context(
+                "Backend service startup failed",
+                extra_attributes={
+                    "error.type": type(startup_error).__name__,
+                    "error.message": str(startup_error),
+                    "operation": "service_startup",
+                    "status": "failed"
+                },
+                exc_info=True
+            )
+            raise
+    
+    yield
+    
+    # Shutdown with proper trace correlation
+    with tracer.start_as_current_span("backend_service_shutdown") as shutdown_span:
+        shutdown_span.set_attributes({
+            "service.name": "document-rag-backend",
+            "lifecycle.phase": "shutdown",
+            "shutdown.timestamp": datetime.now().isoformat()
+        })
         
-    finally:
-        if service_instance:
-            service_instance.stop_monitoring()
+        logger.info_with_context(
+            "Shutting down Backend Service",
+            extra_attributes={
+                "operation": "service_shutdown"
+            }
+        )
+        
+        if service:
+            with tracer.start_as_current_span("stop_monitoring") as stop_span:
+                stop_span.set_attributes({
+                    "service.name": "document-rag-backend",
+                    "operation.name": "stop_monitoring"
+                })
+                
+                service.stop_monitoring()
+                stop_span.set_attribute("monitoring.stopped", True)
+        
         if 'monitoring_task' in locals():
             monitoring_task.cancel()
+        
+        shutdown_span.set_attribute("shutdown.completed", True)
+        logger.info_with_context(
+            "Backend service shutdown completed",
+            extra_attributes={
+                "operation": "service_shutdown",
+                "status": "completed"
+            }
+        )
 
+# FastAPI app for status monitoring
 app = FastAPI(
     title="Document Processing Backend Service",
+    description="Continuous monitoring and processing of documents with complete OpenTelemetry correlation",
     version="2.0.0",
     lifespan=lifespan
 )
 
+# Instrument FastAPI with correlation
 app = instrument_fastapi_app(app, "document-rag-backend")
+
+# Add correlation middleware
+@app.middleware("http")
+async def add_correlation_headers(request: Request, call_next):
+    """Add correlation headers to all requests"""
+    # Extract trace context from incoming headers
+    carrier = dict(request.headers)
+    ctx = extract_and_activate_context(carrier)
+    
+    # Process request with extracted context
+    response = await call_next(request)
+    
+    # Add correlation headers to response
+    current_span = trace.get_current_span()
+    if current_span != trace.INVALID_SPAN:
+        span_context = current_span.get_span_context()
+        response.headers["X-Trace-ID"] = format(span_context.trace_id, '032x')
+        response.headers["X-Span-ID"] = format(span_context.span_id, '016x')
+        response.headers["X-Service-Name"] = "document-rag-backend"
+        response.headers["X-Service-Version"] = "2.0.0"
+    
+    return response
+
+@app.get("/")
+async def root(request: Request):
+    """Root endpoint with correlation"""
+    context = extract_and_activate_context(dict(request.headers))
+    
+    with tracer.start_as_current_span("backend_root_endpoint") as span:
+        span.set_attributes({
+            "service.name": "document-rag-backend",
+            "http.method": "GET",
+            "http.route": "/"
+        })
+        
+        logger.debug_with_context(
+            "Root endpoint accessed",
+            extra_attributes={
+                "operation": "root_endpoint"
+            }
+        )
+        
+        return {
+            "service": "document-rag-backend", 
+            "version": "2.0.0",
+            "status": "running",
+            "orchestrator": orchestrator_url
+        }
 
 @app.get("/health")
 async def health_check(request: Request):
+    """Health check endpoint"""
     context = extract_and_activate_context(dict(request.headers))
     
     with tracer.start_as_current_span("health_check") as span:
@@ -844,87 +2096,211 @@ async def health_check(request: Request):
 
 @app.get("/status")
 async def get_status(request: Request):
+    """Get service status with correlation"""
     context = extract_and_activate_context(dict(request.headers))
     
-    if not service_instance:
-        logger.error_with_context(
-            "Status requested but service not initialized",
+    with tracer.start_as_current_span("backend_get_status") as span:
+        span.set_attributes({
+            "service.name": "document-rag-backend",
+            "http.method": "GET",
+            "http.route": "/status"
+        })
+        
+        if not service:
+            logger.error_with_context(
+                "Status requested but service not initialized",
+                extra_attributes={
+                    "operation": "status_check"
+                }
+            )
+            span.set_status(Status(StatusCode.ERROR, "Service not initialized"))
+            raise HTTPException(status_code=503, detail="Service not initialized")
+        
+        status = service.get_status()
+        span.set_attributes({
+            "is_running": status["service"]["is_running"],
+            "files_processed": status["processing"]["files_processed_session"],
+            "total_files": status["processing"]["total_files_processed"]
+        })
+        
+        logger.debug_with_context(
+            "Status information provided",
             extra_attributes={
+                "service.is_running": status["service"]["is_running"],
+                "files.processed": status["processing"]["files_processed_session"],
                 "operation": "status_check"
             }
         )
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    
-    status = service_instance.get_service_status()
-    
-    logger.debug_with_context(
-        "Status information provided",
-        extra_attributes={
-            "service.is_running": status["service"]["is_running"],
-            "files.processed": status["processing"]["files_processed"],
-            "operation": "status_check"
-        }
-    )
-    
-    return status
+        
+        return status
 
 @app.post("/scan")
 async def trigger_scan(request: Request):
+    """Manually trigger a scan with correlation"""
     context = extract_and_activate_context(dict(request.headers))
     
-    if not service_instance or not service_instance.is_running:
-        logger.error_with_context(
-            "Scan requested but service not running",
+    with tracer.start_as_current_span("backend_trigger_manual_scan") as span:
+        span.set_attributes({
+            "service.name": "document-rag-backend",
+            "http.method": "POST",
+            "http.route": "/scan"
+        })
+        
+        if not service:
+            raise HTTPException(status_code=503, detail="Service not initialized")
+        
+        if not service.is_running:
+            logger.error_with_context(
+                "Scan requested but service not running",
+                extra_attributes={
+                    "service.initialized": service is not None,
+                    "service.is_running": service.is_running if service else False,
+                    "operation": "manual_scan"
+                }
+            )
+            raise HTTPException(status_code=503, detail="Service not running")
+        
+        logger.info_with_context(
+            "Manual scan triggered via API",
             extra_attributes={
-                "service.initialized": service_instance is not None,
-                "service.is_running": service_instance.is_running if service_instance else False,
                 "operation": "manual_scan"
             }
         )
-        raise HTTPException(status_code=503, detail="Service not running")
-    
-    logger.info_with_context(
-        "Manual scan triggered via API",
-        extra_attributes={
-            "operation": "manual_scan"
-        }
-    )
-    
-    asyncio.create_task(service_instance.scan_and_process_cycle())
-    
-    return {"message": "Scan triggered"}
+        
+        asyncio.create_task(asyncio.to_thread(service.scan_and_process))
+        
+        return {"message": "Scan triggered successfully"}
 
-@app.get("/")
-async def root(request: Request):
+@app.post("/stop")
+async def stop_service(request: Request):
+    """Stop the monitoring service"""
     context = extract_and_activate_context(dict(request.headers))
     
-    return {
-        "service": "document-rag-backend",
-        "version": "2.0.0",
-        "orchestrator": orchestrator_url
-    }
+    with tracer.start_as_current_span("backend_stop_service"):
+        if not service:
+            raise HTTPException(status_code=503, detail="Service not initialized")
+        
+        service.stop_monitoring()
+        
+        logger.info_with_context(
+            "Service stopped via API",
+            extra_attributes={
+                "operation": "service_stop"
+            }
+        )
+        
+        return {"message": "Service stopped"}
+
+@app.post("/start")
+async def start_service(request: Request):
+    """Start the monitoring service"""
+    context = extract_and_activate_context(dict(request.headers))
+    
+    with tracer.start_as_current_span("backend_start_service"):
+        if not service:
+            raise HTTPException(status_code=503, detail="Service not initialized")
+        
+        if service.is_running:
+            return {"message": "Service already running"}
+        
+        asyncio.create_task(service.start_monitoring())
+        
+        logger.info_with_context(
+            "Service started via API",
+            extra_attributes={
+                "operation": "service_start"
+            }
+        )
+        
+        return {"message": "Service started"}
+
+@app.post("/reset")
+async def reset_processed_files(request: Request):
+    """Clear the processed files database"""
+    context = extract_and_activate_context(dict(request.headers))
+    
+    with tracer.start_as_current_span("backend_reset_processed_files"):
+        if not service:
+            raise HTTPException(status_code=503, detail="Service not initialized")
+        
+        try:
+            service.fingerprint_db.clear_processed_files()
+            
+            logger.info_with_context(
+                "Processed files database cleared",
+                extra_attributes={
+                    "operation": "database_reset"
+                }
+            )
+            
+            return {"message": "Processed files database cleared successfully"}
+        except Exception as e:
+            logger.error_with_context(
+                "Failed to clear processed files database",
+                extra_attributes={
+                    "error.type": type(e).__name__,
+                    "error.message": str(e),
+                    "operation": "database_reset"
+                },
+                exc_info=True
+            )
+            raise HTTPException(status_code=500, detail=f"Failed to clear database: {e}")
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8001)
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Document Processing Backend Service")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8001, help="Port to bind to")
+    parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
     
-    print(f"🚀 Backend Service")
-    print(f"📡 Orchestrator: {orchestrator_url}")
+    args = parser.parse_args()
     
     # Log service startup
     startup_logger = get_correlated_logger("startup")
-    startup_logger.info_with_context(
-        "Backend service starting up",
-        extra_attributes={
-            "host": args.host,
-            "port": args.port,
-            "orchestrator_url": orchestrator_url,
-            "operation": "service_startup"
-        }
-    )
     
-    uvicorn.run(app, host=args.host, port=args.port)
+    # Create immediate startup spans
+    with tracer.start_as_current_span("backend_main_startup") as main_span:
+        main_span.set_attributes({
+            "service.name": "document-rag-backend",
+            "service.version": "2.0.0",
+            "startup.mode": "standalone",
+            "startup.host": args.host,
+            "startup.port": args.port,
+            "startup.timestamp": datetime.now().isoformat()
+        })
+        
+        startup_logger.info_with_context(
+            "Backend service starting up",
+            extra_attributes={
+                "host": args.host,
+                "port": args.port,
+                "orchestrator_url": orchestrator_url,
+                "startup.mode": "standalone",
+                "operation": "service_startup"
+            }
+        )
+        
+        print(f"🚀 Backend Service")
+        print(f"📡 Orchestrator: {orchestrator_url}")
+        print(f"🌐 Starting server on {args.host}:{args.port}")
+        print(f"🆔 Startup Trace ID: {format(main_span.get_span_context().trace_id, '032x')}")
+        print(f"📤 OTEL Endpoint: {os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT')}")
+        print("🔗 Service Map: Will be visible immediately after startup")
+        print("=" * 60)
+        
+        with tracer.start_as_current_span("uvicorn_server_start") as uvicorn_span:
+            uvicorn_span.set_attributes({
+                "service.name": "document-rag-backend",
+                "server.host": args.host,
+                "server.port": args.port,
+                "server.type": "uvicorn"
+            })
+            
+            uvicorn.run(
+                "backend_service:app",
+                host=args.host,
+                port=args.port,
+                reload=args.reload,
+                log_level="info"
+            )

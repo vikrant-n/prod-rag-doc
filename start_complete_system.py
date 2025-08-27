@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced Orchestrator with HTTP Server for Service Map Connectivity and Correlated Logging
+Fixed to properly start backend services with console output and proper environment handling
 """
 
 import os
@@ -9,13 +10,13 @@ import subprocess
 import asyncio
 import signal
 import time
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List
 from dataclasses import dataclass
 from enum import Enum
 from aiohttp import web
-import threading
 
 from dotenv import load_dotenv
 
@@ -42,10 +43,11 @@ load_dotenv()
 from otel_config import (
     initialize_opentelemetry, get_service_tracer,
     get_current_trace_id, extract_and_activate_context, propagate,
-    get_correlated_logger, enhanced_error_logging # NEW: Import correlated logger
+    get_correlated_logger, enhanced_error_logging
 )
 from opentelemetry.trace import SpanKind
 from opentelemetry.context import attach, detach
+from opentelemetry import trace
 
 # Initialize correlated logger
 logger = get_correlated_logger(__name__)
@@ -72,6 +74,39 @@ class ServiceProcess:
     started_at: datetime
     pid: int
 
+def log_stream_reader(stream, service_name, logger, log_level="INFO"):
+    """Read from subprocess stream and log to console with proper formatting"""
+    try:
+        for line in iter(stream.readline, ''):
+            if line:
+                line = line.strip()
+                if line:
+                    # Format the output with service name and timestamp
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    print(f"[{timestamp}] [{service_name}] {line}")
+                    
+                    # Also log through structured logging
+                    logger.info_with_context(
+                        f"Service log: {line}",
+                        extra_attributes={
+                            "service.name": service_name,
+                            "log.source": "subprocess",
+                            "operation": "service_logging"
+                        }
+                    )
+    except Exception as e:
+        logger.error_with_context(
+            f"Error reading stream for {service_name}",
+            extra_attributes={
+                "service.name": service_name,
+                "error.type": type(e).__name__,
+                "error.message": str(e),
+                "operation": "stream_reading"
+            }
+        )
+    finally:
+        stream.close()
+
 class ProcessManager:
     def __init__(self, tracer):
         self.tracer = tracer
@@ -85,7 +120,9 @@ class ProcessManager:
         ) as span:
             span.set_attributes({
                 "service.child": config.name,
-                "service.port": config.port
+                "service.port": config.port,
+                "service.name": "document-rag-orchestrator",
+                "operation.name": "start_service"
             })
             
             self.logger.info_with_context(
@@ -98,50 +135,141 @@ class ProcessManager:
                 }
             )
             
+            # Start with current environment
             env = os.environ.copy()
-            if config.environment:
-                env.update(config.environment)
-
+            
             # Get span context for propagation
             span_context = span.get_span_context()
             trace_id = format(span_context.trace_id, '032x')
-            span_id = format(span_context.span_id, '016x') 
+            span_id = format(span_context.span_id, '016x')
             
-            # Pass orchestrator URL to children
-            env.update({
+            # Create proper trace headers for child service
+            trace_headers = {
+                "traceparent": f"00-{trace_id}-{span_id}-01",
+                "tracestate": "",
+            }
+            
+            self.logger.info_with_context(
+                f"Creating trace context for {config.name}",
+                extra_attributes={
+                    "service.name": config.name,
+                    "trace.parent_id": trace_id,
+                    "span.parent_id": span_id,
+                    "trace.headers": trace_headers,
+                    "operation": "trace_propagation"
+                }
+            )
+            
+            # Preserve all existing environment variables and add new ones
+            service_env = {
+                # OpenTelemetry configuration - CRITICAL for service map
+                "OTEL_SERVICE_NAME": config.name,
+                "OTEL_SERVICE_VERSION": "2.0.0",
+                "OTEL_SERVICE_NAMESPACE": "document-rag-system",
+                "OTEL_ENVIRONMENT": os.getenv("OTEL_ENVIRONMENT", "production"),
+                "OTEL_RESOURCE_ATTRIBUTES": f"service.name={config.name},service.version=2.0.0,service.namespace=document-rag-system,deployment.environment=production",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+                "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+                "OTEL_EXPORTER_OTLP_INSECURE": "true",
+                "OTEL_TRACES_EXPORTER": "otlp",
+                "OTEL_METRICS_EXPORTER": "otlp", 
+                "OTEL_LOGS_EXPORTER": "otlp",
+                "OTEL_TRACES_SAMPLER": "always_on",  # Changed from traceidratio for debugging
+                "OTEL_TRACES_SAMPLER_ARG": "1.0",
+                "OTEL_PYTHON_LOG_CORRELATION": "true",  # Enable for better correlation
+                "OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED": "true",
+                
+                # Trace propagation
                 "OTEL_PARENT_TRACE_ID": trace_id,
                 "OTEL_PARENT_SPAN_ID": span_id,
-                "OTEL_SERVICE_NAME": config.name,
                 "OTEL_SERVICE_PARENT": "document-rag-orchestrator",
-                "ORCHESTRATOR_URL": "http://localhost:8002",  # Orchestrator HTTP endpoint
-                "OTEL_EXPORTER_OTLP_ENDPOINT": os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
-                "OTEL_PYTHON_LOG_CORRELATION": "false"
-            })
+                "TRACEPARENT": trace_headers["traceparent"],
+                
+                # Service communication
+                "ORCHESTRATOR_URL": "http://localhost:8002",
+                
+                # Preserve critical environment variables
+                "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
+                "GOOGLE_DRIVE_FOLDER_ID": os.getenv("GOOGLE_DRIVE_FOLDER_ID"),
+                "GOOGLE_CREDENTIALS_PATH": os.getenv("GOOGLE_CREDENTIALS_PATH"),
+                "GOOGLE_TOKEN_PATH": os.getenv("GOOGLE_TOKEN_PATH"),
+                "LOCAL_WATCH_DIRS": os.getenv("LOCAL_WATCH_DIRS"),
+                "SCAN_INTERVAL": os.getenv("SCAN_INTERVAL"),
+                
+                # Embedding and processing configuration
+                "EMBEDDING_MODEL": os.getenv("EMBEDDING_MODEL", "text-embedding-3-large"),
+                "EMBEDDING_VECTOR_SIZE": os.getenv("EMBEDDING_VECTOR_SIZE", "3072"),
+                "CHUNK_SIZE": os.getenv("CHUNK_SIZE", "3000"),
+                "CHUNK_OVERLAP": os.getenv("CHUNK_OVERLAP", "300"),
+                "BATCH_SIZE": os.getenv("BATCH_SIZE", "5"),
+                "RETRIEVAL_INITIAL_K": os.getenv("RETRIEVAL_INITIAL_K", "20"),
+                "RETRIEVAL_FETCH_K": os.getenv("RETRIEVAL_FETCH_K", "10"),
+                "RETRIEVAL_FINAL_K": os.getenv("RETRIEVAL_FINAL_K", "5"),
+                "RETRIEVAL_TOP_N": os.getenv("RETRIEVAL_TOP_N", "5"),
+                "CONTEXT_OUTPUT_FILE": os.getenv("CONTEXT_OUTPUT_FILE"),
+                "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO"),
+                
+                # Python path to ensure imports work
+                "PYTHONPATH": os.pathsep.join([
+                    str(Path(__file__).parent),
+                    os.getenv("PYTHONPATH", "")
+                ]).rstrip(os.pathsep),
+            }
+            
+            # Add service-specific environment variables
+            if config.environment:
+                service_env.update(config.environment)
+            
+            # Remove None values
+            service_env = {k: v for k, v in service_env.items() if v is not None}
+            
+            # Update the environment
+            env.update(service_env)
 
-            self.logger.debug_with_context(
+            self.logger.info_with_context(
                 f"Environment prepared for service: {config.name}",
                 extra_attributes={
                     "service.name": config.name,
                     "trace.parent_id": trace_id,
                     "span.parent_id": span_id,
                     "orchestrator.url": "http://localhost:8002",
+                    "otel.endpoint": service_env.get("OTEL_EXPORTER_OTLP_ENDPOINT"),
+                    "otel.service_name": service_env.get("OTEL_SERVICE_NAME"),
+                    "python_path": service_env.get("PYTHONPATH"),
+                    "working_dir": str(Path(__file__).parent),
                     "operation": "service_startup"
                 }
             )
 
             print(f"🚀 Starting {config.name}")
+            print(f"   Command: {' '.join(config.command)}")
+            print(f"   Working Dir: {Path(__file__).parent}")
+            print(f"   OTEL Endpoint: {service_env.get('OTEL_EXPORTER_OTLP_ENDPOINT')}")
+            print(f"   Trace Parent: {trace_id}")
             
             try:
+                # Start the process with real-time output
                 process = subprocess.Popen(
                     config.command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                     env=env,
-                    cwd=Path(__file__).parent
+                    cwd=str(Path(__file__).parent),
+                    bufsize=1,  # Line buffering
+                    universal_newlines=True
                 )
 
-                time.sleep(3)
+                # Start thread to read and display output in real-time
+                output_thread = threading.Thread(
+                    target=log_stream_reader,
+                    args=(process.stdout, config.name, self.logger),
+                    daemon=True
+                )
+                output_thread.start()
+
+                # Wait a bit to see if the process starts successfully
+                time.sleep(5)
 
                 if process.poll() is None:
                     service_proc = ServiceProcess(
@@ -161,21 +289,33 @@ class ProcessManager:
                             "service.pid": process.pid,
                             "service.port": config.port,
                             "service.status": ServiceStatus.RUNNING.value,
-                            "startup.duration_seconds": 3,
+                            "startup.duration_seconds": 5,
+                            "trace.child_id": trace_id,
                             "operation": "service_startup",
                             "status": "success"
                         }
                     )
                     
-                    print(f"✅ {config.name} started (PID: {process.pid})")
+                    print(f"✅ {config.name} started successfully (PID: {process.pid})")
+                    print(f"   Trace ID: {trace_id}")
                     return service_proc
                 else:
-                    error_msg = f"Process exited with code {process.poll()}"
+                    exit_code = process.poll()
+                    error_msg = f"Process exited with code {exit_code}"
+                    
+                    # Try to read any remaining output
+                    try:
+                        remaining_output = process.stdout.read()
+                        if remaining_output:
+                            print(f"   Last output: {remaining_output}")
+                    except:
+                        pass
+                    
                     self.logger.error_with_context(
                         f"Service failed to start: {config.name}",
                         extra_attributes={
                             "service.name": config.name,
-                            "service.exit_code": process.poll(),
+                            "service.exit_code": exit_code,
                             "error.message": error_msg,
                             "operation": "service_startup",
                             "status": "failed"
@@ -184,16 +324,18 @@ class ProcessManager:
                     raise RuntimeError(f"Failed to start {config.name}: {error_msg}")
                     
             except Exception as e:
-                # Replace existing error logging
                 enhanced_error_logging(
                     self.logger,
                     f"Exception during service startup: {config.name}",
                     extra_attributes={
                         "service.name": config.name,
+                        "service.command": " ".join(config.command),
+                        "working_dir": str(Path(__file__).parent),
                         "operation": "service_startup",
                         "status": "exception"
                     }
                 )
+                print(f"❌ Exception starting {config.name}: {e}")
                 raise
 
     def terminate_all(self):
@@ -518,7 +660,10 @@ class EnhancedOrchestrator:
                 name="document-rag-backend",
                 command=[sys.executable, "backend_service.py", "--host", "0.0.0.0", "--port", "8001"],
                 port=8001,
-                environment={"HOST": "0.0.0.0", "PORT": "8001"}
+                environment={
+                    "HOST": "0.0.0.0", 
+                    "PORT": "8001"
+                }
             ),
             "api": ServiceConfig(
                 name="document-rag-api", 
@@ -540,12 +685,18 @@ class EnhancedOrchestrator:
                 "orchestrator.version": "2.0.0",
                 "services.configured": len(self.service_configs),
                 "services.list": list(self.service_configs.keys()),
+                "working_dir": str(Path(__file__).parent),
                 "operation": "orchestrator_init"
             }
         )
 
     def check_environment(self) -> bool:
         with self.tracer.start_as_current_span("environment_check") as span:
+            span.set_attributes({
+                "service.name": "document-rag-orchestrator",
+                "operation.name": "environment_check"
+            })
+            
             self.logger.info_with_context(
                 "Starting environment validation",
                 extra_attributes={
@@ -555,6 +706,73 @@ class EnhancedOrchestrator:
             
             required_vars = ["OPENAI_API_KEY", "OTEL_EXPORTER_OTLP_ENDPOINT"]
             missing = [var for var in required_vars if not os.getenv(var)]
+            
+            # Check critical environment variables
+            env_check = {
+                "OPENAI_API_KEY": "✅ Set" if os.getenv("OPENAI_API_KEY") else "❌ Missing",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": f"✅ {os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT')}" if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") else "❌ Missing",
+                "GOOGLE_DRIVE_FOLDER_ID": f"✅ {os.getenv('GOOGLE_DRIVE_FOLDER_ID')}" if os.getenv("GOOGLE_DRIVE_FOLDER_ID") else "⚠️ Optional",
+                "EMBEDDING_MODEL": f"✅ {os.getenv('EMBEDDING_MODEL', 'text-embedding-3-large')}",
+                "CHUNK_SIZE": f"✅ {os.getenv('CHUNK_SIZE', '3000')}",
+                "CHUNK_OVERLAP": f"✅ {os.getenv('CHUNK_OVERLAP', '300')}",
+            }
+            
+            print("🔍 Environment Check:")
+            for var, status in env_check.items():
+                print(f"   {var}: {status}")
+            
+            # Test OTEL connectivity
+            otel_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+            if otel_endpoint:
+                try:
+                    import requests
+                    # Try to connect to OTEL endpoint (without authentication)
+                    # Just check if the host is reachable
+                    host = otel_endpoint.replace("http://", "").replace("https://", "").split(":")[0]
+                    port = otel_endpoint.split(":")[-1] if ":" in otel_endpoint else "4317"
+                    
+                    # Test OTEL connectivity
+                    print(f"🔗 Testing OTEL connectivity to {host}:{port}...")
+                    
+                    # Create a test span to verify OTEL is working
+                    with self.tracer.start_as_current_span("otel_connectivity_test") as test_span:
+                        test_span.set_attributes({
+                            "test.type": "connectivity",
+                            "otel.endpoint": otel_endpoint,
+                            "service.name": "document-rag-orchestrator",
+                            "test.timestamp": datetime.now().isoformat()
+                        })
+                        
+                        test_trace_id = format(test_span.get_span_context().trace_id, '032x')
+                        print(f"✅ OTEL test span created")
+                        print(f"   Test Trace ID: {test_trace_id}")
+                        print(f"   Should appear in Kibana within 30 seconds")
+                        
+                        # Force flush to send immediately
+                        try:
+                            from opentelemetry.sdk.trace import TracerProvider
+                            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+                            
+                            # Get the tracer provider and force flush
+                            tracer_provider = trace.get_tracer_provider()
+                            if hasattr(tracer_provider, '_active_span_processor'):
+                                tracer_provider._active_span_processor.force_flush(timeout_millis=5000)
+                                print(f"✅ OTEL spans flushed to endpoint")
+                        except Exception as flush_error:
+                            print(f"⚠️ Could not force flush OTEL spans: {flush_error}")
+                        
+                except Exception as e:
+                    print(f"⚠️ OTEL connectivity test failed: {e}")
+                    print(f"   This may affect service map visibility in Kibana")
+                    self.logger.warning_with_context(
+                        "OTEL connectivity test failed",
+                        extra_attributes={
+                            "otel.endpoint": otel_endpoint,
+                            "error.type": type(e).__name__,
+                            "error.message": str(e),
+                            "operation": "environment_check"
+                        }
+                    )
             
             if missing:
                 self.logger.error_with_context(
@@ -566,19 +784,14 @@ class EnhancedOrchestrator:
                         "status": "failed"
                     }
                 )
-                print(f"❌ Missing: {', '.join(missing)}")
+                print(f"❌ Missing required variables: {', '.join(missing)}")
                 return False
-            
-            # Log available environment variables (without values for security)
-            env_status = {}
-            for var in required_vars:
-                env_status[var] = "set" if os.getenv(var) else "missing"
             
             self.logger.info_with_context(
                 "Environment validation passed",
                 extra_attributes={
                     "required_variables": required_vars,
-                    "environment_status": env_status,
+                    "environment_status": env_check,
                     "operation": "environment_check",
                     "status": "success"
                 }
@@ -639,12 +852,19 @@ class EnhancedOrchestrator:
                 )
                 return False
             
-            os.chdir(Path(__file__).parent)
+            # Ensure we're in the correct working directory
+            original_cwd = os.getcwd()
+            target_dir = Path(__file__).parent
+            if original_cwd != str(target_dir):
+                print(f"📁 Changing working directory: {original_cwd} -> {target_dir}")
+                os.chdir(target_dir)
             
             # Start each service with logging
             services_started = 0
             for service_name in ["backend", "api"]:
                 try:
+                    print(f"\n🔄 Starting service: {service_name}")
+                    
                     self.logger.info_with_context(
                         f"Starting service: {service_name}",
                         extra_attributes={
@@ -658,7 +878,7 @@ class EnhancedOrchestrator:
                     )
                     
                     self.process_manager.start_service(self.service_configs[service_name])
-                    await asyncio.sleep(4)
+                    await asyncio.sleep(6)  # Give more time for service to fully start
                     services_started += 1
                     
                     self.logger.info_with_context(
@@ -673,6 +893,8 @@ class EnhancedOrchestrator:
                             "operation": "system_startup"
                         }
                     )
+                    
+                    print(f"✅ {service_name} is ready\n")
                     
                 except Exception as e:
                     self.logger.error_with_context(
@@ -725,7 +947,11 @@ class EnhancedOrchestrator:
             return True
 
     def display_system_info(self):
-        trace_id = get_current_trace_id()
+        # Get current trace context
+        current_span = trace.get_current_span()
+        trace_id = "unknown"
+        if current_span != trace.INVALID_SPAN:
+            trace_id = format(current_span.get_span_context().trace_id, '032x')
         
         self.logger.info_with_context(
             "System information display",
@@ -739,12 +965,22 @@ class EnhancedOrchestrator:
             }
         )
         
-        print("\n✅ Document RAG System Ready!")
+        print("\n" + "="*70)
+        print("✅ Document RAG System Ready!")
+        print("=" * 70)
         print("📡 Orchestrator HTTP: http://localhost:8002")
         print("📊 Main UI: http://localhost:8000")
         print("⚙️  Backend: http://localhost:8001")
-        print(f"🆔 Trace ID: {trace_id}")
+        print(f"🆔 System Trace ID: {trace_id}")
+        print(f"📤 OTEL Endpoint: {os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT')}")
         print("=" * 70)
+        print("📝 Service logs will appear below:")
+        print("-" * 70)
+        
+        # Show process information
+        for name, proc in self.process_manager.processes.items():
+            print(f"🔧 {name}: PID {proc.pid}, Port {proc.config.port}, Status {proc.status.value}")
+        print("-" * 70)
 
     def setup_signal_handlers(self):
         def signal_handler(signum, frame):
@@ -788,101 +1024,132 @@ class EnhancedOrchestrator:
 async def main():
     startup_logger = get_correlated_logger("startup")
     
-    startup_logger.info_with_context(
-        "Orchestrator starting up",
-        extra_attributes={
-            "orchestrator.version": "2.0",
-            "operation": "main_startup"
-        }
+    # Initialize the tracer early to get proper trace context
+    tracer, meter = initialize_opentelemetry(
+        "document-rag-orchestrator", "2.0.0", "production"
     )
     
-    print("🚀 ORCHESTRATOR v2.0 with HTTP Server")
-    print()
-    
-    orchestrator = EnhancedOrchestrator()
-    
-    try:
-        success = await orchestrator.start_system()
+    with tracer.start_as_current_span("orchestrator_main_startup") as main_span:
+        main_span.set_attributes({
+            "service.name": "document-rag-orchestrator",
+            "service.version": "2.0.0",
+            "operation.name": "main_startup"
+        })
         
-        if not success:
-            startup_logger.error_with_context(
-                "Orchestrator startup failed",
-                extra_attributes={
-                    "operation": "main_startup",
-                    "status": "failed"
-                }
-            )
-            print("❌ Startup failed")
-            sys.exit(1)
+        trace_id = format(main_span.get_span_context().trace_id, '032x')
+        span_id = format(main_span.get_span_context().span_id, '016x')
         
         startup_logger.info_with_context(
-            "Orchestrator startup completed successfully",
+            "Orchestrator starting up",
             extra_attributes={
-                "operation": "main_startup",
-                "status": "success"
+                "orchestrator.version": "2.0",
+                "trace.id": trace_id,
+                "span.id": span_id,
+                "otel.endpoint": os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+                "operation": "main_startup"
             }
         )
         
-        print("🔄 System running...")
+        print("🚀 ORCHESTRATOR v2.0 with HTTP Server")
+        print(f"🆔 Main Trace ID: {trace_id}")
+        print(f"📡 OTEL Endpoint: {os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT')}")
+        print()
         
-        # Main orchestrator loop with periodic heartbeats
-        heartbeat_count = 0
-        while orchestrator.is_running:
-            with orchestrator.tracer.start_as_current_span("orchestrator.heartbeat"):
-                heartbeat_count += 1
-                
-                if heartbeat_count % 6 == 0:  # Log every minute (6 * 10 seconds)
-                    orchestrator.logger.debug_with_context(
-                        "Orchestrator heartbeat",
-                        extra_attributes={
-                            "heartbeat.count": heartbeat_count,
-                            "system.uptime_seconds": (datetime.now() - orchestrator.startup_time).total_seconds(),
-                            "services.running": len(orchestrator.process_manager.processes),
-                            "operation": "orchestrator_heartbeat"
-                        }
-                    )
-                
-                await asyncio.sleep(10)
-                
-    except KeyboardInterrupt:
-        orchestrator.logger.info_with_context(
-            "Shutdown requested via keyboard interrupt",
-            extra_attributes={
-                "operation": "main_shutdown",
-                "shutdown.reason": "keyboard_interrupt"
-            }
-        )
-        print("\n🔄 Shutdown requested")
-    except Exception as e:
-        orchestrator.logger.error_with_context(
-            "Unexpected error in main loop",
-            extra_attributes={
-                "error.type": type(e).__name__,
-                "error.message": str(e),
-                "operation": "main_loop",
-                "status": "unexpected_error"
-            },
-            exc_info=True
-        )
-        print(f"\n❌ Unexpected error: {e}")
-    finally:
-        orchestrator.logger.info_with_context(
-            "Initiating final cleanup",
-            extra_attributes={
-                "operation": "main_cleanup"
-            }
-        )
+        orchestrator = EnhancedOrchestrator()
         
-        orchestrator.process_manager.terminate_all()
-        await orchestrator.http_server.stop()
-        
-        orchestrator.logger.info_with_context(
-            "Orchestrator shutdown completed",
-            extra_attributes={
-                "operation": "main_cleanup",
-                "status": "completed"
-            }
-        )
+        try:
+            success = await orchestrator.start_system()
+            
+            if not success:
+                startup_logger.error_with_context(
+                    "Orchestrator startup failed",
+                    extra_attributes={
+                        "operation": "main_startup",
+                        "status": "failed"
+                    }
+                )
+                print("❌ Startup failed")
+                sys.exit(1)
+            
+            startup_logger.info_with_context(
+                "Orchestrator startup completed successfully",
+                extra_attributes={
+                    "operation": "main_startup",
+                    "status": "success"
+                }
+            )
+            
+            print("🔄 System running... (Press Ctrl+C to stop)")
+            
+            # Main orchestrator loop with periodic heartbeats
+            heartbeat_count = 0
+            while orchestrator.is_running:
+                with orchestrator.tracer.start_as_current_span("orchestrator.heartbeat") as heartbeat_span:
+                    heartbeat_count += 1
+                    
+                    heartbeat_span.set_attributes({
+                        "service.name": "document-rag-orchestrator",
+                        "heartbeat.count": heartbeat_count,
+                        "operation.name": "orchestrator_heartbeat"
+                    })
+                    
+                    if heartbeat_count % 6 == 0:  # Log every minute (6 * 10 seconds)
+                        current_trace = format(heartbeat_span.get_span_context().trace_id, '032x')
+                        
+                        orchestrator.logger.debug_with_context(
+                            "Orchestrator heartbeat",
+                            extra_attributes={
+                                "heartbeat.count": heartbeat_count,
+                                "system.uptime_seconds": (datetime.now() - orchestrator.startup_time).total_seconds(),
+                                "services.running": len(orchestrator.process_manager.processes),
+                                "trace.current": current_trace,
+                                "operation": "orchestrator_heartbeat"
+                            }
+                        )
+                        
+                        print(f"💓 Orchestrator heartbeat #{heartbeat_count} (Trace: {current_trace[:8]}...)")
+                    
+                    await asyncio.sleep(10)
+                    
+        except KeyboardInterrupt:
+            orchestrator.logger.info_with_context(
+                "Shutdown requested via keyboard interrupt",
+                extra_attributes={
+                    "operation": "main_shutdown",
+                    "shutdown.reason": "keyboard_interrupt"
+                }
+            )
+            print("\n🔄 Shutdown requested")
+        except Exception as e:
+            orchestrator.logger.error_with_context(
+                "Unexpected error in main loop",
+                extra_attributes={
+                    "error.type": type(e).__name__,
+                    "error.message": str(e),
+                    "operation": "main_loop",
+                    "status": "unexpected_error"
+                },
+                exc_info=True
+            )
+            print(f"\n❌ Unexpected error: {e}")
+        finally:
+            orchestrator.logger.info_with_context(
+                "Initiating final cleanup",
+                extra_attributes={
+                    "operation": "main_cleanup"
+                }
+            )
+            
+            orchestrator.process_manager.terminate_all()
+            await orchestrator.http_server.stop()
+            
+            orchestrator.logger.info_with_context(
+                "Orchestrator shutdown completed",
+                extra_attributes={
+                    "operation": "main_cleanup",
+                    "status": "completed"
+                }
+            )
 
 if __name__ == "__main__":
     asyncio.run(main())
