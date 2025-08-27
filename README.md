@@ -318,12 +318,75 @@ tail -f backend_service.log
 pip install -r requirements.txt
 ```
 
+**5. "All connection attempts failed" (Backend Connection Error)**
+```bash
+# Check if backend service is running on port 8001
+curl http://localhost:8001/health
+
+# Check if both services are running
+ps aux | grep python | grep -E "(backend_service|start_server)"
+
+# Verify ports are not blocked
+netstat -tlnp | grep -E "(8000|8001)"
+
+# Start services in correct order:
+# Terminal 1: Backend service first
+python backend_service.py
+
+# Terminal 2: API service second
+python start_server.py
+```
+
+**6. "OpenTelemetry connection failed"**
+```bash
+# Check if OTEL collector is running (if using)
+# For development, you can disable OTEL by setting:
+export OTEL_EXPORTER_OTLP_ENDPOINT=""
+
+# Or run without OTEL instrumentation:
+python run_system.py
+```
+
+**7. "Service Connection Issues" (Common in Production)**
+```bash
+# The error "All connection attempts failed" usually means:
+# - Backend service is not running on port 8001
+# - Services started in wrong order
+# - Firewall blocking connections
+
+# Solution: Start services in correct order
+# Terminal 1: Start Qdrant (if not using Docker)
+# Terminal 2: Start backend service
+python backend_service.py
+
+# Terminal 3: Start API service (after backend is ready)
+python start_server.py
+
+# Verify all services are running:
+curl http://localhost:6333  # Qdrant
+curl http://localhost:8001/health  # Backend
+curl http://localhost:8000/health  # API
+```
+
 ### Performance Optimization
 
 1. **Embedding Model**: Use `text-embedding-3-small` for faster processing
 2. **Chunk Size**: Reduce `CHUNK_SIZE` for faster indexing
 3. **Qdrant**: Use persistent storage for production
 4. **Batch Processing**: Process multiple documents simultaneously
+
+### Service Startup Order
+
+**Important**: Services must be started in the correct order:
+
+1. **Qdrant Database** (port 6333)
+2. **Backend Service** (port 8001) - Document processing
+3. **API Service** (port 8000) - Web interface and queries
+
+**Why this order matters:**
+- Backend service needs Qdrant to be available
+- API service needs backend service to be available
+- Starting in wrong order causes connection errors
 
 ## 📈 Scaling for Production
 
@@ -348,6 +411,14 @@ docker run -p 8000:8000 -p 8001:8001 document-rag
 - Google Cloud: Use Cloud Run or GKE
 - Azure: Use Container Instances or AKS
 
+### Production Considerations
+
+- **Environment Variables**: Use proper secret management
+- **SSL/TLS**: Configure HTTPS with reverse proxy
+- **Monitoring**: Set up OpenTelemetry collector
+- **Backup**: Implement Qdrant data backup strategy
+- **Security**: Add authentication and rate limiting
+
 ## 📝 License
 
 This project is provided as-is for production use. Ensure compliance with:
@@ -362,6 +433,13 @@ For issues and questions:
 2. Review system logs for error messages
 3. Verify all environment variables are correctly set
 4. Ensure all dependencies are properly installed
+
+### Getting Help
+
+- **Check Logs**: Look for error messages in console output
+- **Verify Services**: Ensure all services are running on correct ports
+- **Test Connections**: Use curl to test service endpoints
+- **Debug Mode**: Run `python debug_api.py` to test imports
 
 ---
 
@@ -379,3 +457,18 @@ For issues and questions:
 - [ ] Monitoring and logging setup
 - [ ] Backup strategy implemented
 - [ ] Security review completed
+
+**Quick Test Commands:**
+```bash
+# Test Qdrant
+curl http://localhost:6333
+
+# Test Backend
+curl http://localhost:8001/health
+
+# Test API
+curl http://localhost:8000/health
+
+# Check running processes
+ps aux | grep python | grep -E "(backend|api)"
+```

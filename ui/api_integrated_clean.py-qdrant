@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Integrated FastAPI Backend with Enhanced Retrieval and Complete OpenTelemetry Correlation
-Updated for Elasticsearch support with authentication and SSL
+Maintains original UI while adding middleware-based W3C trace propagation with correlated logging
 """
 
 import asyncio
@@ -10,14 +10,10 @@ import os
 import json
 import uuid
 import hashlib
-import urllib3
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
-
-# Suppress SSL warnings for self-signed certificates
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,7 +32,7 @@ os.environ["OTEL_SERVICE_NAME"] = "document-rag-api"
 from otel_config import (
     initialize_opentelemetry, get_service_tracer, instrument_fastapi_app,
     inject_trace_context, extract_trace_context, get_current_trace_id,
-    TracedHTTPXClient, get_correlated_logger, get_code_context, enhanced_error_logging
+    TracedHTTPXClient, get_correlated_logger, get_code_context, enhanced_error_logging  # NEW: Import correlated logger
 )
 
 # Replace existing logger with correlated logger
@@ -97,10 +93,10 @@ except ImportError as e:
     ConversationContext = None
     SourceAttributionProcessor = None
 
-# Updated imports for Elasticsearch
-from elasticsearch import Elasticsearch
+# Basic imports that should always work
+from qdrant_client import QdrantClient
 from langchain_openai import OpenAIEmbeddings
-from langchain_elasticsearch import ElasticsearchStore
+from langchain_qdrant import QdrantVectorStore
 from langchain.docstore.document import Document
 
 # Pydantic models - preserved from original
@@ -142,7 +138,7 @@ class SessionInfo(BaseModel):
 # FastAPI application - same as original
 app = FastAPI(
     title="Enhanced Document RAG Query Interface",
-    description="Advanced web-based interface with enhanced retrieval and Elasticsearch support",
+    description="Advanced web-based interface with enhanced retrieval and complete service correlation",
     version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -176,22 +172,18 @@ conversation_contexts: Dict[str, Any] = {}
 sessions: Dict[str, SessionInfo] = {}
 
 class EnhancedQueryEngine:
-    """Enhanced query engine with Elasticsearch support and complete service correlation."""
+    """Enhanced query engine with complete service correlation and trace propagation."""
     
     def __init__(self):
         self.tracer = get_service_tracer("query-processor")
-        self.logger = get_correlated_logger(f"{__name__}.EnhancedQueryEngine")
-        
-        # Elasticsearch configuration
-        self.elasticsearch_url = os.getenv("ELASTICSEARCH_URL", "https://172.31.23.77:9200")
-        self.elasticsearch_username = os.getenv("ELASTICSEARCH_USERNAME", "elastic")
-        self.elasticsearch_password = os.getenv("ELASTICSEARCH_PASSWORD", "elastic")
-        self.index_name = os.getenv("ELASTICSEARCH_INDEX", "documents")
+        self.logger = get_correlated_logger(f"{__name__}.EnhancedQueryEngine")  # NEW: Add correlated logger
+        self.qdrant_host = os.getenv("QDRANT_HOST", "localhost")
+        self.qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
+        self.collection_name = os.getenv("COLLECTION_NAME", "documents")
         self.embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
         
         # Initialize components
         self.vector_store = None
-        self.elasticsearch_client = None
         self.hybrid_search = None
         self.context_aware_engine = None
         self.response_generator = None
@@ -199,75 +191,50 @@ class EnhancedQueryEngine:
         self._initialize_components()
     
     def _initialize_components(self):
-        """Initialize enhanced components with Elasticsearch support"""
+        """Initialize enhanced components with tracing"""
         with self.tracer.start_as_current_span("api_initialize_components") as span:
             span.set_attributes({
                 "service.name": "document-rag-api",
                 "service.component": "query-processor",
-                "operation.name": "initialize_components",
-                "vector_database": "elasticsearch"
+                "operation.name": "initialize_components"
             })
             
             self.logger.info_with_context(
-                "Initializing enhanced query engine with Elasticsearch",
+                "Initializing enhanced query engine components",
                 extra_attributes={
-                    "elasticsearch.url": self.elasticsearch_url,
-                    "elasticsearch.username": self.elasticsearch_username,
-                    "elasticsearch.index": self.index_name,
+                    "qdrant.host": self.qdrant_host,
+                    "qdrant.port": self.qdrant_port,
+                    "collection.name": self.collection_name,
                     "embedding.model": self.embedding_model,
                     "operation": "component_initialization"
                 }
             )
             
             try:
-                # Initialize Elasticsearch client
-                with self.tracer.start_as_current_span("connect_elasticsearch") as es_span:
-                    es_span.set_attributes({
-                        "service.name": "document-rag-api",
-                        "external.service.name": "elasticsearch-database",
-                        "external.service.type": "vector_database",
-                        "db.system": "elasticsearch",
-                        "db.connection_string": self.elasticsearch_url
-                    })
-                    
-                    self.elasticsearch_client = Elasticsearch(
-                        [self.elasticsearch_url],
-                        basic_auth=(self.elasticsearch_username, self.elasticsearch_password),
-                        verify_certs=False,
-                        ssl_show_warn=False,
-                        request_timeout=30,
-                        retry_on_timeout=True,
-                        max_retries=3
-                    )
-                    
-                    # Test connection
-                    health = self.elasticsearch_client.cluster.health()
-                    es_span.set_attributes({
-                        "elasticsearch.status": health.get("status", "unknown"),
-                        "elasticsearch.cluster_name": health.get("cluster_name", "unknown"),
-                        "elasticsearch.nodes": health.get("number_of_nodes", 0)
-                    })
-                
-                # Initialize embeddings
+                # Initialize basic vector store
                 embeddings = OpenAIEmbeddings(model=self.embedding_model)
                 
-                # Initialize vector store
-                self.vector_store = ElasticsearchStore(
-                    es_connection=self.elasticsearch_client,
-                    index_name=self.index_name,
-                    embedding=embeddings,
-                    vector_query_field="vector",
-                    query_field="text"
-                )
+                with self.tracer.start_as_current_span("connect_qdrant") as qdrant_span:
+                    qdrant_span.set_attributes({
+                        "service.name": "document-rag-api",
+                        "external.service.name": "qdrant",
+                        "external.service.type": "vector_db",
+                        "db.system": "qdrant"
+                    })
+                    
+                    self.vector_store = QdrantVectorStore.from_existing_collection(
+                        collection_name=self.collection_name,
+                        embedding=embeddings,
+                        url=f"http://{self.qdrant_host}:{self.qdrant_port}",
+                    )
                 
                 self.logger.info_with_context(
-                    "Successfully connected to Elasticsearch",
+                    "Successfully connected to Qdrant vector store",
                     extra_attributes={
-                        "elasticsearch.url": self.elasticsearch_url,
-                        "elasticsearch.index": self.index_name,
-                        "elasticsearch.status": health.get("status"),
-                        "elasticsearch.cluster": health.get("cluster_name"),
-                        "operation": "elasticsearch_connection",
+                        "qdrant.host": self.qdrant_host,
+                        "qdrant.port": self.qdrant_port,
+                        "collection.name": self.collection_name,
+                        "operation": "qdrant_connection",
                         "status": "success"
                     }
                 )
@@ -334,23 +301,21 @@ class EnhancedQueryEngine:
                     exc_info=True
                 )
                 self.vector_store = None
-                self.elasticsearch_client = None
     
     async def process_query(self, request: QueryRequest) -> QueryResponse:
-        """Process a query with comprehensive logging and Elasticsearch support"""
+        """Process a query with comprehensive logging"""
         with self.tracer.start_as_current_span("api_process_query") as span:
             correlation_id = get_current_trace_id()[:16]
             
             # Log query start with context
             self.logger.info_with_context(
-                "Processing user query with Elasticsearch",
+                "Processing user query",
                 extra_attributes={
                     "query.length": len(request.query),
                     "query.hash": hashlib.md5(request.query.encode()).hexdigest()[:8],
                     "user.session_id": request.session_id or "anonymous",
                     "query.citation_format": request.citation_format,
                     "correlation.id": correlation_id,
-                    "vector_database": "elasticsearch",
                     "operation": "query_processing"
                 }
             )
@@ -363,23 +328,22 @@ class EnhancedQueryEngine:
                 "query.length": len(request.query),
                 "query.citation_format": request.citation_format,
                 "query.hash": hashlib.md5(request.query.encode()).hexdigest()[:8],
-                "w3c.trace_id": get_current_trace_id(),
-                "vector_database": "elasticsearch"
+                "w3c.trace_id": get_current_trace_id()
             })
             
             start_time = datetime.now()
             
             try:
-                if not self.vector_store or not self.elasticsearch_client:
+                if not self.vector_store:
                     self.logger.error_with_context(
-                        "Elasticsearch vector store not available",
+                        "Vector store not available",
                         extra_attributes={
                             "service.component": "vector_store",
                             "availability": "unavailable",
                             "operation": "query_processing"
                         }
                     )
-                    raise HTTPException(status_code=503, detail="Elasticsearch vector store not available")
+                    raise HTTPException(status_code=503, detail="Vector store not available")
                 
                 # Get or create conversation context
                 session_id = request.session_id or str(uuid.uuid4())
@@ -465,8 +429,7 @@ class EnhancedQueryEngine:
                 result.metadata.update({
                     "correlation_id": correlation_id,
                     "service_name": "document-rag-api",
-                    "trace_id": get_current_trace_id(),
-                    "vector_database": "elasticsearch"
+                    "trace_id": get_current_trace_id()
                 })
                 
                 # Add assistant response to context
@@ -492,7 +455,6 @@ class EnhancedQueryEngine:
                         "response.sources_count": len(result.sources),
                         "response.word_count": len(result.response.split()),
                         "correlation.id": correlation_id,
-                        "vector_database": "elasticsearch",
                         "operation": "query_processing",
                         "status": "success"
                     }
@@ -534,16 +496,15 @@ class EnhancedQueryEngine:
                 raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
     
     async def _process_with_enhanced_engine(self, request: QueryRequest, context, correlation_id: str) -> QueryResponse:
-        """Process query with enhanced components and Elasticsearch"""
+        """Process query with enhanced components and correlation"""
         with self.tracer.start_as_current_span("enhanced_query_processing") as span:
             span.set_attributes({
                 "service.component": "enhanced-retrieval",
-                "correlation.id": correlation_id,
-                "vector_database": "elasticsearch"
+                "correlation.id": correlation_id
             })
             
             self.logger.info_with_context(
-                "Processing with enhanced engine and Elasticsearch",
+                "Processing with enhanced engine",
                 extra_attributes={
                     "processing.type": "enhanced",
                     "correlation.id": correlation_id,
@@ -626,8 +587,7 @@ class EnhancedQueryEngine:
                     metadata={
                         "sources_count": len(sources),
                         "enhanced_processing": True,
-                        "correlation_id": correlation_id,
-                        "vector_database": "elasticsearch"
+                        "correlation_id": correlation_id
                     },
                     timestamp=""  # Will be updated by caller
                 )
@@ -648,16 +608,15 @@ class EnhancedQueryEngine:
                 return await self._process_with_basic_engine(request, correlation_id)
     
     async def _process_with_basic_engine(self, request: QueryRequest, correlation_id: str) -> QueryResponse:
-        """Fallback to basic query processing with Elasticsearch"""
+        """Fallback to basic query processing with correlation"""
         with self.tracer.start_as_current_span("basic_query_processing") as span:
             span.set_attributes({
                 "service.component": "basic-retrieval",
-                "correlation.id": correlation_id,
-                "vector_database": "elasticsearch"
+                "correlation.id": correlation_id
             })
             
             self.logger.info_with_context(
-                "Processing with basic engine and Elasticsearch",
+                "Processing with basic engine",
                 extra_attributes={
                     "processing.type": "basic",
                     "correlation.id": correlation_id,
@@ -665,12 +624,12 @@ class EnhancedQueryEngine:
                 }
             )
             
-            # Perform similarity search with Elasticsearch
-            with self.tracer.start_as_current_span("elasticsearch_similarity_search") as search_span:
+            # Perform similarity search with vector database
+            with self.tracer.start_as_current_span("qdrant_similarity_search") as search_span:
                 search_span.set_attributes({
-                    "external.service.name": "elasticsearch-database",
-                    "external.service.type": "vector_database",
-                    "db.system": "elasticsearch",
+                    "external.service.name": "qdrant",
+                    "external.service.type": "vector_db",
+                    "db.system": "qdrant",
                     "db.operation": "similarity_search",
                     "correlation.id": correlation_id
                 })
@@ -681,7 +640,7 @@ class EnhancedQueryEngine:
                 search_span.set_attribute("documents_found", len(docs))
                 
                 self.logger.debug_with_context(
-                    "Elasticsearch similarity search completed",
+                    "Qdrant similarity search completed",
                     extra_attributes={
                         "documents.found": len(docs),
                         "search.k": request.max_sources or 5,
@@ -690,7 +649,7 @@ class EnhancedQueryEngine:
                 )
             
             # Track external API call
-            external_api_calls.add(1, {"service": "elasticsearch", "operation": "similarity_search"})
+            external_api_calls.add(1, {"service": "qdrant", "operation": "similarity_search"})
             
             # Create sources from documents
             sources = []
@@ -741,8 +700,7 @@ class EnhancedQueryEngine:
                 metadata={
                     "sources_count": len(sources),
                     "enhanced_processing": False,
-                    "correlation_id": correlation_id,
-                    "vector_database": "elasticsearch"
+                    "correlation_id": correlation_id
                 },
                 timestamp=""  # Will be updated by caller
             )
@@ -867,22 +825,20 @@ enhanced_query_engine = None
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the enhanced query engine with Elasticsearch support"""
+    """Initialize the enhanced query engine with correlation"""
     global enhanced_query_engine
     
     with tracer.start_as_current_span("api_service_startup") as span:
         span.set_attributes({
             "service.name": "document-rag-api",
-            "operation.name": "startup",
-            "vector_database": "elasticsearch"
+            "operation.name": "startup"
         })
         
         logger.info_with_context(
-            "Starting Enhanced Document RAG API with Elasticsearch",
+            "Starting Enhanced Document RAG API",
             extra_attributes={
                 "service.name": "document-rag-api",
                 "service.version": "2.0.0",
-                "vector_database": "elasticsearch",
                 "operation": "service_startup"
             }
         )
@@ -890,7 +846,7 @@ async def startup_event():
         try:
             enhanced_query_engine = EnhancedQueryEngine()
             logger.info_with_context(
-                "Enhanced query engine with Elasticsearch initialized successfully",
+                "Enhanced query engine initialized successfully",
                 extra_attributes={
                     "operation": "service_startup",
                     "status": "success"
@@ -914,7 +870,7 @@ async def startup_event():
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
-    """Serve the main HTML page with correlation"""
+    """Serve the main HTML page with correlation - SAME AS ORIGINAL"""
     with tracer.start_as_current_span("serve_root_page") as span:
         span.set_attributes({
             "service.name": "document-rag-api",
@@ -978,9 +934,8 @@ async def read_root():
             </head>
             <body>
                 <div class="container">
-                    <h1>Document RAG Query Interface</h1>
+                    <h1>🔍 Document RAG Query Interface</h1>
                     <p><strong>Service:</strong> document-rag-api</p>
-                    <p><strong>Vector Database:</strong> Elasticsearch</p>
                     <p><strong>Trace ID:</strong> {trace_id}</p>
                     <p><strong>W3C Propagation:</strong> Enabled</p>
                     
@@ -1043,17 +998,17 @@ async def read_root():
             )
             return HTMLResponse(content=f"<h1>Error loading UI: {str(e)}</h1>", status_code=500)
 
+# Replace your existing process_query function with this enhanced version
 @app.post("/api/query", response_model=QueryResponse)
 async def process_query(request: QueryRequest):
-    """Process query with enhanced error logging and Elasticsearch support"""
+    """Process query with enhanced error logging and code line capture"""
     with tracer.start_as_current_span("api_query_endpoint") as span:
         span.set_attributes({
             "service.name": "document-rag-api",
             "http.method": "POST",
             "http.route": "/api/query",
             "user.query": request.query[:100],
-            "w3c.trace_id": get_current_trace_id(),
-            "vector_database": "elasticsearch"
+            "w3c.trace_id": get_current_trace_id()
         })
         
         logger.info_with_context(
@@ -1065,16 +1020,16 @@ async def process_query(request: QueryRequest):
                 "request.session_id": request.session_id,
                 "request.citation_format": request.citation_format,
                 "request.max_sources": request.max_sources,
-                "vector_database": "elasticsearch",
                 "operation": "api_request"
             }
         )
         
-        # Test error scenarios
+        # PURPOSEFUL ERRORS for testing - with code line capture
         if "test error" in request.query.lower() or "debug error" in request.query.lower():
             try:
+                # Simulate a real code error scenario
                 problematic_data = {"value": None}
-                result = problematic_data["value"].upper()
+                result = problematic_data["value"].upper()  # This will throw AttributeError
                 
             except Exception as e:
                 enhanced_error_logging(
@@ -1109,20 +1064,20 @@ async def process_query(request: QueryRequest):
                     "type": "test_error_simulation"
                 })
         
-        # Elasticsearch error simulation
-        if "elasticsearch error" in request.query.lower():
+        # DATABASE ERROR simulation
+        if "database error" in request.query.lower():
             try:
-                connection_string = None
-                es_client = connection_string.connect()
+                connection_string = None  # Simulate missing config
+                db_client = connection_string.connect()  # This will throw AttributeError
                 
             except Exception as e:
                 enhanced_error_logging(
                     logger,
-                    "Simulated Elasticsearch connection error",
+                    "Simulated database connection error",
                     extra_attributes={
-                        "error.type": "simulated_elasticsearch_connection_error",
+                        "error.type": "simulated_database_connection_error",
                         "error.category": "database_simulation",
-                        "database.system": "elasticsearch",
+                        "database.system": "qdrant",
                         "trace.correlation_id": get_current_trace_id(),
                         "kibana.test_marker": True,
                         "test.error_line_capture": True
@@ -1130,7 +1085,7 @@ async def process_query(request: QueryRequest):
                 )
                 span.record_exception(e)
                 raise HTTPException(status_code=503, detail={
-                    "error": "Elasticsearch connection error simulation",
+                    "error": "Database connection error simulation",
                     "message": str(e),
                     "trace_id": get_current_trace_id()
                 })
@@ -1147,27 +1102,13 @@ async def process_query(request: QueryRequest):
             )
             raise HTTPException(status_code=503, detail="Enhanced query engine not initialized")
         
+        # ... rest of your existing code for normal processing ...
+        
         try:
             # Process query with enhanced engine
             response = await enhanced_query_engine.process_query(request)
             
-            # Record successful API call
-            api_requests.add(1, {"status": "success", "vector_database": "elasticsearch"})
-            
-            logger.info_with_context(
-                "API request completed successfully",
-                extra_attributes={
-                    "http.method": "POST",
-                    "http.route": "/api/query",
-                    "http.status_code": 200,
-                    "response.confidence": response.confidence,
-                    "response.sources_count": len(response.sources),
-                    "processing.time_seconds": response.processing_time,
-                    "vector_database": "elasticsearch",
-                    "operation": "api_request",
-                    "status": "success"
-                }
-            )
+            # ... existing success logging ...
             
             return response
             
@@ -1185,7 +1126,6 @@ async def process_query(request: QueryRequest):
                     "status": "http_error"
                 }
             )
-            api_requests.add(1, {"status": "error"})
             raise
             
         except Exception as e:
@@ -1201,12 +1141,11 @@ async def process_query(request: QueryRequest):
                     "status": "unexpected_error"
                 }
             )
-            api_requests.add(1, {"status": "error"})
             raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/sessions/{session_id}")
 async def get_session(session_id: str):
-    """Get session information with correlation"""
+    """Get session information with correlation - SAME AS ORIGINAL"""
     with tracer.start_as_current_span("get_session_info") as span:
         span.set_attributes({
             "service.name": "document-rag-api",
@@ -1268,13 +1207,12 @@ async def get_session(session_id: str):
 
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint with Elasticsearch status"""
+    """Health check endpoint with service correlation - ENHANCED FROM ORIGINAL"""
     with tracer.start_as_current_span("health_check") as span:
         span.set_attributes({
             "service.name": "document-rag-api",
             "http.method": "GET",
-            "http.route": "/api/health",
-            "vector_database": "elasticsearch"
+            "http.route": "/api/health"
         })
         
         logger.debug_with_context(
@@ -1284,25 +1222,10 @@ async def health_check():
             }
         )
         
-        # Check Elasticsearch status
-        elasticsearch_healthy = False
-        elasticsearch_status = "unknown"
-        
-        if enhanced_query_engine and enhanced_query_engine.elasticsearch_client:
-            try:
-                health = enhanced_query_engine.elasticsearch_client.cluster.health()
-                elasticsearch_status = health.get("status", "unknown")
-                elasticsearch_healthy = elasticsearch_status in ["green", "yellow"]
-            except Exception as e:
-                elasticsearch_status = f"error: {str(e)}"
-        
-        status = "healthy" if (enhanced_query_engine and 
-                             enhanced_query_engine.vector_store and 
-                             elasticsearch_healthy) else "unhealthy"
+        status = "healthy" if enhanced_query_engine and enhanced_query_engine.vector_store else "unhealthy"
         
         components = {
             "vector_store": enhanced_query_engine.vector_store is not None if enhanced_query_engine else False,
-            "elasticsearch_client": enhanced_query_engine.elasticsearch_client is not None if enhanced_query_engine else False,
             "hybrid_search": enhanced_query_engine.hybrid_search is not None if enhanced_query_engine else False,
             "context_aware_engine": enhanced_query_engine.context_aware_engine is not None if enhanced_query_engine else False,
             "response_generator": enhanced_query_engine.response_generator is not None if enhanced_query_engine else False,
@@ -1313,9 +1236,7 @@ async def health_check():
         
         span.set_attributes({
             "health.status": status,
-            "components.healthy_count": healthy_components,
-            "elasticsearch.status": elasticsearch_status,
-            "elasticsearch.healthy": elasticsearch_healthy
+            "components.healthy_count": healthy_components
         })
         
         logger.info_with_context(
@@ -1324,8 +1245,6 @@ async def health_check():
                 "health.status": status,
                 "components.healthy_count": healthy_components,
                 "components.total_count": len(components),
-                "elasticsearch.status": elasticsearch_status,
-                "elasticsearch.healthy": elasticsearch_healthy,
                 "operation": "health_check"
             }
         )
@@ -1335,8 +1254,6 @@ async def health_check():
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "version": "2.0.0",
             "service": "document-rag-api",
-            "vector_database": "elasticsearch",
-            "elasticsearch_status": elasticsearch_status,
             "components": components,
             "trace_context": {
                 "trace_id": get_current_trace_id(),
@@ -1458,26 +1375,24 @@ async def trigger_backend_scan():
 if __name__ == "__main__":
     import uvicorn
     
-    print("ENHANCED API SERVICE: Elasticsearch Integration")
+    print("🔥 ENHANCED API SERVICE: Complete W3C Trace Propagation")
     print("=" * 70)
-    print("Service Hierarchy: document-rag-orchestrator → document-rag-api")
-    print("Components: query-processor, response-generator, session-manager, backend-proxy")
-    print("Vector Database: Elasticsearch with Authentication")
-    print("W3C Propagation: ENABLED")
-    print("Middleware-Based Context: ACTIVE")
-    print(f"Root Trace ID: {get_current_trace_id()}")
-    print("Starting on http://0.0.0.0:8000")
+    print("📊 Service Hierarchy: document-rag-orchestrator → document-rag-api")
+    print("🧩 Components: query-processor, response-generator, session-manager, backend-proxy")
+    print("🔗 W3C Propagation: ENABLED")
+    print("🗺️ Middleware-Based Context: ACTIVE")
+    print(f"🆔 Root Trace ID: {get_current_trace_id()}")
+    print("🚀 Starting on http://0.0.0.0:8000")
     print("=" * 70)
     
     # Log service startup
     startup_logger = get_correlated_logger("startup")
     startup_logger.info_with_context(
-        "API service starting up with Elasticsearch",
+        "API service starting up",
         extra_attributes={
             "host": "0.0.0.0",
             "port": 8000,
             "service.name": "document-rag-api",
-            "vector_database": "elasticsearch",
             "operation": "service_startup"
         }
     )

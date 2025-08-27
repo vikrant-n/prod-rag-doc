@@ -1,9 +1,5 @@
 import sys
-import urllib3
 from dotenv import load_dotenv
-
-# Suppress SSL warnings for self-signed certificates
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Load environment variables
 load_dotenv()
@@ -12,8 +8,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from loaders.google_drive_loader import GoogleDriveMasterLoader
 from langchain_openai import OpenAIEmbeddings
-from langchain_elasticsearch import ElasticsearchStore
-from elasticsearch import Elasticsearch
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
 import os
 
 def split_documents(documents, chunk_size=1000, chunk_overlap=120):
@@ -187,15 +183,11 @@ def split_documents(documents, chunk_size=1000, chunk_overlap=120):
 FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 TOKEN_PATH = os.getenv("GOOGLE_TOKEN_PATH", "token.json")
-
-# Elasticsearch configuration
-ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "https://172.31.23.77:9200")
-ELASTICSEARCH_USERNAME = os.getenv("ELASTICSEARCH_USERNAME", "elastic")
-ELASTICSEARCH_PASSWORD = os.getenv("ELASTICSEARCH_PASSWORD", "elastic")
-ELASTICSEARCH_INDEX = os.getenv("ELASTICSEARCH_INDEX", "documents")
-
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "documents")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
-VECTOR_SIZE = int(os.getenv("EMBEDDING_VECTOR_SIZE", "3072"))  # For text-embedding-3-large
+VECTOR_SIZE = 3072  # For text-embedding-3-large
 
 # Default chunking constants for export
 DEFAULT_CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "3000"))
@@ -204,16 +196,10 @@ DEFAULT_CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
 # Note: FOLDER_ID validation moved to main() function to avoid import-time errors
 
 def main():
-    """Main function to process documents from Google Drive and upload to Elasticsearch"""
+    """Main function to process documents from Google Drive"""
     # Validate required environment variables
     if not FOLDER_ID:
         raise ValueError("GOOGLE_DRIVE_FOLDER_ID environment variable is required")
-    
-    print("Starting Google Drive to Elasticsearch processing...")
-    print(f"Elasticsearch URL: {ELASTICSEARCH_URL}")
-    print(f"Target Index: {ELASTICSEARCH_INDEX}")
-    print(f"Embedding Model: {EMBEDDING_MODEL}")
-    print(f"Vector Size: {VECTOR_SIZE}")
     
     # --- 1. Load all documents from Google Drive ---
     loader = GoogleDriveMasterLoader(
@@ -229,162 +215,38 @@ def main():
     chunks = split_documents(docs, chunk_size=1024, chunk_overlap=100)
     print(f"Created {len(chunks)} chunks from all Google Drive docs.")
 
-    if not chunks:
-        print("No chunks created. Exiting.")
-        return
-
-    # --- 3. Connect to Elasticsearch and setup index ---
-    print("Connecting to Elasticsearch...")
-    client = Elasticsearch(
-        [ELASTICSEARCH_URL],
-        basic_auth=(ELASTICSEARCH_USERNAME, ELASTICSEARCH_PASSWORD),
-        verify_certs=False,
-        ssl_show_warn=False,
-        request_timeout=60,
-        retry_on_timeout=True,
-        max_retries=3
+    # --- 3. Connect to Qdrant and (re)create collection ---
+    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=120)
+    if client.collection_exists(COLLECTION_NAME):
+        print("Deleting existing collection...")
+        client.delete_collection(collection_name=COLLECTION_NAME)
+    print("Creating new collection...")
+    client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config={"size": VECTOR_SIZE, "distance": "Cosine"}
     )
-    
-    # Test connection
-    try:
-        health = client.cluster.health()
-        print(f"Connected to Elasticsearch cluster: {health.get('cluster_name')}")
-        print(f"Cluster status: {health.get('status')}")
-    except Exception as e:
-        print(f"Failed to connect to Elasticsearch: {e}")
-        return
-    
-    # Check if index exists and optionally recreate it
-    if client.indices.exists(index=ELASTICSEARCH_INDEX):
-        recreate = input(f"Index '{ELASTICSEARCH_INDEX}' exists. Recreate it? (y/N): ").strip().lower()
-        if recreate == 'y':
-            print(f"Deleting existing index '{ELASTICSEARCH_INDEX}'...")
-            client.indices.delete(index=ELASTICSEARCH_INDEX)
-            print("Creating new index...")
-            create_index_with_mapping(client, ELASTICSEARCH_INDEX, VECTOR_SIZE)
-        else:
-            print(f"Using existing index '{ELASTICSEARCH_INDEX}'")
-    else:
-        print(f"Creating new index '{ELASTICSEARCH_INDEX}'...")
-        create_index_with_mapping(client, ELASTICSEARCH_INDEX, VECTOR_SIZE)
 
-    # --- 4. Embed and upload chunks to Elasticsearch ---
-    print("Setting up embeddings and vector store...")
+    # --- 4. Embed and upload chunks to Qdrant ---
     embedding_function = OpenAIEmbeddings(model=EMBEDDING_MODEL)
-    
-    vectorstore = ElasticsearchStore(
-        es_connection=client,
-        index_name=ELASTICSEARCH_INDEX,
-        embedding=embedding_function,
-        vector_query_field="vector",
-        query_field="text"
+    vectorstore = QdrantVectorStore(
+        client=client,
+        collection_name=COLLECTION_NAME,
+        embedding=embedding_function
     )
-    
-    print("Uploading chunks to Elasticsearch...")
-    BATCH_SIZE = 20  # Smaller batch size for Elasticsearch
-    
+    print("Uploading chunks to Qdrant...")
+    BATCH_SIZE = 50
     for i in range(0, len(chunks), BATCH_SIZE):
         batch = chunks[i:i+BATCH_SIZE]
-        try:
-            vectorstore.add_documents(batch)
-            print(f"Uploaded batch {i//BATCH_SIZE + 1}/{(len(chunks) + BATCH_SIZE - 1)//BATCH_SIZE} ({len(batch)} documents)")
-        except Exception as e:
-            print(f"Error uploading batch {i//BATCH_SIZE + 1}: {e}")
-            # Try individual documents in this batch
-            for doc in batch:
-                try:
-                    vectorstore.add_documents([doc])
-                except Exception as doc_error:
-                    print(f"Failed to upload single document: {doc_error}")
-    
-    # Refresh the index to make documents searchable
-    try:
-        client.indices.refresh(index=ELASTICSEARCH_INDEX)
-        print("Index refreshed.")
-    except Exception as e:
-        print(f"Warning: Could not refresh index: {e}")
-    
-    print("Done! All chunks embedded and uploaded to Elasticsearch.")
+        vectorstore.add_documents(batch)
+    print("Done! All chunks embedded and uploaded to Qdrant.")
 
     # --- (Optional) Print a few chunks for verification ---
-    print("\nSample chunks:")
     for i, chunk in enumerate(chunks[:3], 1):
         print(f"--- Chunk {i} ---")
         print("Metadata:", chunk.metadata)
-        print("Content:", chunk.page_content[:200] + ("..." if len(chunk.page_content) > 200 else ""))
-    
-    # Verify upload by checking index stats
-    try:
-        stats = client.indices.stats(index=ELASTICSEARCH_INDEX)
-        doc_count = stats['indices'][ELASTICSEARCH_INDEX]['total']['docs']['count']
-        size_bytes = stats['indices'][ELASTICSEARCH_INDEX]['total']['store']['size_in_bytes']
-        print(f"\nFinal index statistics:")
-        print(f"Documents in index: {doc_count:,}")
-        print(f"Index size: {size_bytes:,} bytes ({size_bytes/1024/1024:.2f} MB)")
-    except Exception as e:
-        print(f"Could not get index statistics: {e}")
-
-def create_index_with_mapping(client, index_name, vector_size):
-    """Create Elasticsearch index with proper vector mapping"""
-    
-    index_mapping = {
-        "mappings": {
-            "properties": {
-                "text": {"type": "text"},
-                "vector": {
-                    "type": "dense_vector",
-                    "dims": vector_size,
-                    "index": True,
-                    "similarity": "cosine"
-                },
-                "metadata": {
-                    "type": "object",
-                    "properties": {
-                        "document_type": {"type": "keyword"},
-                        "file_name": {"type": "keyword"},
-                        "file_path": {"type": "keyword"},
-                        "heading": {"type": "text"},
-                        "content_type": {"type": "keyword"},
-                        "slide_number": {"type": "integer"},
-                        "section_title": {"type": "text"},
-                        "sheet_name": {"type": "keyword"},
-                        "column_headers": {"type": "text"},
-                        "drive_file_name": {"type": "keyword"},
-                        "processed_at": {"type": "date"},
-                        "file_size": {"type": "long"},
-                        "mime_type": {"type": "keyword"},
-                        "trace_id": {"type": "keyword"},
-                        "processing_service": {"type": "keyword"}
-                    }
-                }
-            }
-        },
-        "settings": {
-            "number_of_shards": 1,
-            "number_of_replicas": 0,
-            "refresh_interval": "30s",
-            "index": {
-                "max_result_window": 50000  # Allow larger result sets if needed
-            }
-        }
-    }
-    
-    try:
-        client.indices.create(index=index_name, body=index_mapping)
-        print(f"Successfully created index '{index_name}' with vector mapping")
-        
-        # Verify the mapping was created correctly
-        mapping = client.indices.get_mapping(index=index_name)
-        props = mapping[index_name]['mappings']['properties']
-        
-        if 'vector' in props and props['vector'].get('type') == 'dense_vector':
-            print(f"Vector field configured with {props['vector'].get('dims')} dimensions")
-        else:
-            print("Warning: Vector field may not be configured correctly")
-            
-    except Exception as e:
-        print(f"Error creating index: {e}")
-        raise
+        print("Content:", chunk.page_content[:200], "...")
 
 if __name__ == "__main__":
     main()
+
+    

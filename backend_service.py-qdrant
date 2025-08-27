@@ -37,10 +37,11 @@ import httpx
 
 # Document processing imports
 from langchain_core.documents import Document
-from langchain_elasticsearch import ElasticsearchStore
+from langchain_qdrant import QdrantVectorStore
 from langchain_openai import OpenAIEmbeddings
-from elasticsearch import Elasticsearch
-from elasticsearch.exceptions import ConnectionError as ESConnectionError, RequestError
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 # Loaders
 from loaders.master_loaders import load_file
@@ -175,32 +176,34 @@ class FileFingerprintDatabase:
             )
             return result
     
-    def is_file_in_elasticsearch(self, file_path: str, elasticsearch_client) -> bool:
-        """Check if a file already has embeddings in Elasticsearch"""
+    def is_file_in_qdrant(self, file_path: str, qdrant_client) -> bool:
+        """Check if a file already has embeddings in Qdrant"""
         try:
-            with self.tracer.start_as_current_span("elasticsearch_check_file_exists") as span:
+            with self.tracer.start_as_current_span("qdrant_check_file_exists") as span:
                 span.set_attributes({
                     "service.name": "document-rag-backend",
-                    "peer.service": "elasticsearch-database",
-                    "external.service.name": "elasticsearch-database",
+                    "peer.service": "qdrant-database",
+                    "external.service.name": "qdrant-database",
                     "external.service.type": "vector_database",
-                    "db.system": "elasticsearch",
-                    "db.operation": "search",
+                    "db.system": "qdrant",
+                    "db.operation": "scroll",
                     "db.collection.name": "documents"
                 })
                 
-                search_result = elasticsearch_client.search(
-                    index="documents",
-                    body={
-                        "query": {
-                            "term": {
-                                "metadata.file_path.keyword": file_path
+                search_result = qdrant_client.scroll(
+                    collection_name="documents",
+                    scroll_filter={
+                        "must": [
+                            {
+                                "key": "file_path",
+                                "match": {"value": file_path}
                             }
-                        },
-                        "size": 1
-                    }
+                        ]
+                    },
+                    limit=1,
+                    with_payload=True
                 )
-                return search_result['hits']['total']['value'] > 0
+                return len(search_result[0]) > 0
         except Exception as e:
             return False
     
@@ -288,153 +291,106 @@ class FileFingerprintDatabase:
 
 
 class DocumentProcessor:
-    """Handles document processing and embedding with Elasticsearch"""
+    """Handles document processing and embedding with full tracing"""
     
     def __init__(self, 
-                 elasticsearch_url: str = "https://172.31.23.77:9200",
-                 index_name: str = "documents",
-                 embedding_model: str = None,
-                 elasticsearch_username: str = None,
-                 elasticsearch_password: str = None):
-        self.elasticsearch_url = elasticsearch_url
-        self.index_name = index_name
+                 qdrant_url: str = "http://localhost:6333",
+                 collection_name: str = "documents",
+                 embedding_model: str = None):
+        self.qdrant_url = qdrant_url
+        self.collection_name = collection_name
         self.embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
-        self.elasticsearch_username = elasticsearch_username or os.getenv("ELASTICSEARCH_USERNAME", "elastic")
-        self.elasticsearch_password = elasticsearch_password or os.getenv("ELASTICSEARCH_PASSWORD", "elastic")
         
         self.tracer = get_service_tracer("document-processor")
         self.logger = get_correlated_logger(f"{__name__}.DocumentProcessor")
         
         # Initialize components
         self.embeddings = OpenAIEmbeddings(model=self.embedding_model)
-        
-        # Configure Elasticsearch client with authentication and SSL settings
-        self.elasticsearch_client = Elasticsearch(
-            [self.elasticsearch_url],
-            basic_auth=(self.elasticsearch_username, self.elasticsearch_password),
-            verify_certs=False,  # Disable SSL certificate verification
-            ssl_show_warn=False,  # Suppress SSL warnings
-            request_timeout=30,
-            retry_on_timeout=True,
-            max_retries=3
-        )
-        
+        self.qdrant_client = QdrantClient(url=qdrant_url)
         self.vector_store = None
         
-        # Initialize index
-        self._ensure_index_exists()
+        # Initialize collection
+        self._ensure_collection_exists()
         
         self.logger.info_with_context(
             "Document processor initialized",
             extra_attributes={
-                "elasticsearch.url": elasticsearch_url,
-                "elasticsearch.username": self.elasticsearch_username,
-                "index.name": index_name,
+                "qdrant.url": qdrant_url,
+                "collection.name": collection_name,
                 "embedding.model": self.embedding_model,
-                "ssl.verify": False,
                 "operation": "processor_init"
             }
         )
     
-    def _ensure_index_exists(self):
-        """Ensure the Elasticsearch index exists"""
+    def _ensure_collection_exists(self):
+        """Ensure the Qdrant collection exists"""
         try:
-            with self.tracer.start_as_current_span("elasticsearch_ensure_index") as span:
+            with self.tracer.start_as_current_span("qdrant_ensure_collection") as span:
                 span.set_attributes({
                     "service.name": "document-rag-backend",
-                    "peer.service": "elasticsearch-database",
-                    "external.service.name": "elasticsearch-database",
+                    "peer.service": "qdrant-database",
+                    "external.service.name": "qdrant-database",
                     "external.service.type": "vector_database",
-                    "db.system": "elasticsearch",
-                    "db.operation": "check_index",
-                    "db.connection_string": self.elasticsearch_url
+                    "db.system": "qdrant",
+                    "db.operation": "get_collections",
+                    "db.connection_string": self.qdrant_url
                 })
                 
-                # Check if index exists
-                index_exists = self.elasticsearch_client.indices.exists(index=self.index_name)
+                collections = self.qdrant_client.get_collections()
+                collection_names = [col.name for col in collections.collections]
                 
                 vector_size = int(os.getenv("EMBEDDING_VECTOR_SIZE", "3072"))
                 
-                if not index_exists:
-                    with self.tracer.start_as_current_span("elasticsearch_create_index") as create_span:
+                if self.collection_name not in collection_names:
+                    with self.tracer.start_as_current_span("qdrant_create_collection") as create_span:
                         create_span.set_attributes({
                             "service.name": "document-rag-backend",
-                            "peer.service": "elasticsearch-database",
-                            "external.service.name": "elasticsearch-database",
+                            "peer.service": "qdrant-database",
+                            "external.service.name": "qdrant-database",
                             "external.service.type": "vector_database",
-                            "db.system": "elasticsearch",
-                            "db.operation": "create_index",
-                            "db.collection.name": self.index_name,
+                            "db.system": "qdrant",
+                            "db.operation": "create_collection",
+                            "db.collection.name": self.collection_name,
                             "vector.size": vector_size
                         })
                         
                         self.logger.info_with_context(
-                            "Creating new Elasticsearch index",
+                            "Creating new Qdrant collection",
                             extra_attributes={
-                                "index.name": self.index_name,
+                                "collection.name": self.collection_name,
                                 "vector.size": vector_size,
-                                "operation": "index_creation"
+                                "operation": "collection_creation"
                             }
                         )
                         
-                        # Create index with vector mapping
-                        index_mapping = {
-                            "mappings": {
-                                "properties": {
-                                    "text": {"type": "text"},
-                                    "vector": {
-                                        "type": "dense_vector",
-                                        "dims": vector_size,
-                                        "index": True,
-                                        "similarity": "cosine"
-                                    },
-                                    "metadata": {
-                                        "type": "object",
-                                        "properties": {
-                                            "file_id": {"type": "keyword"},
-                                            "file_name": {"type": "keyword"},
-                                            "file_path": {"type": "keyword"},
-                                            "processed_at": {"type": "date"},
-                                            "file_size": {"type": "long"},
-                                            "mime_type": {"type": "keyword"},
-                                            "trace_id": {"type": "keyword"},
-                                            "processing_service": {"type": "keyword"}
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        
-                        self.elasticsearch_client.indices.create(
-                            index=self.index_name,
-                            body=index_mapping
+                        self.qdrant_client.create_collection(
+                            collection_name=self.collection_name,
+                            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
                         )
                 else:
                     self.logger.info_with_context(
-                        "Using existing Elasticsearch index",
+                        "Using existing Qdrant collection",
                         extra_attributes={
-                            "index.name": self.index_name,
-                            "operation": "index_connection"
+                            "collection.name": self.collection_name,
+                            "operation": "collection_connection"
                         }
                     )
                     
-                self.vector_store = ElasticsearchStore(
-                    es_connection=self.elasticsearch_client,
-                    index_name=self.index_name,
-                    embedding=self.embeddings,
-                    vector_query_field="vector",
-                    query_field="text"
+                self.vector_store = QdrantVectorStore(
+                    client=self.qdrant_client,
+                    collection_name=self.collection_name,
+                    embedding=self.embeddings
                 )
             
         except Exception as e:
             self.logger.error_with_context(
-                "Failed to initialize index",
+                "Failed to initialize collection",
                 extra_attributes={
-                    "elasticsearch.url": self.elasticsearch_url,
-                    "index.name": self.index_name,
+                    "qdrant.url": self.qdrant_url,
+                    "collection.name": self.collection_name,
                     "error.type": type(e).__name__,
                     "error.message": str(e),
-                    "operation": "index_init"
+                    "operation": "collection_init"
                 },
                 exc_info=True
             )
@@ -530,45 +486,45 @@ class DocumentProcessor:
                             })
                             
                             try:
-                                # Generate unique document IDs
-                                batch_doc_ids = [
+                                # Generate unique point IDs
+                                batch_point_ids = [
                                     hashlib.md5(f"{file_info['file_path']}_{i+j}_{chunk.page_content[:100]}".encode()).hexdigest()
                                     for j, chunk in enumerate(batch)
                                 ]
                                 
-                                # Add to vector store with Elasticsearch tracing
-                                with self.tracer.start_as_current_span("elasticsearch_store_documents") as es_span:
-                                    es_span.set_attributes({
+                                # Add to vector store with Qdrant tracing
+                                with self.tracer.start_as_current_span("qdrant_store_documents") as qdrant_span:
+                                    qdrant_span.set_attributes({
                                         "service.name": "document-rag-backend",
-                                        "peer.service": "elasticsearch-database",
-                                        "external.service.name": "elasticsearch-database",
+                                        "peer.service": "qdrant-database",
+                                        "external.service.name": "qdrant-database",
                                         "external.service.type": "vector_database",
-                                        "db.system": "elasticsearch",
+                                        "db.system": "qdrant",
                                         "db.operation": "add_documents",
-                                        "db.collection.name": self.index_name,
-                                        "db.connection_string": self.elasticsearch_url
+                                        "db.collection.name": self.collection_name,
+                                        "db.connection_string": self.qdrant_url
                                     })
                                     
-                                    self.vector_store.add_documents(batch, ids=batch_doc_ids)
-                                    point_ids.extend(batch_doc_ids)
+                                    self.vector_store.add_documents(batch, ids=batch_point_ids)
+                                    point_ids.extend(batch_point_ids)
                                     
                                     # Track external API call
-                                    external_api_calls.add(1, {"service": "elasticsearch-database", "operation": "add_documents"})
+                                    external_api_calls.add(1, {"service": "qdrant-database", "operation": "add_documents"})
                                 
-                                batch_span.set_attribute("documents_created", len(batch_doc_ids))
+                                batch_span.set_attribute("points_created", len(batch_point_ids))
                                 
                                 self.logger.debug_with_context(
                                     "Processed embedding batch",
                                     extra_attributes={
                                         "batch.number": i//batch_size + 1,
                                         "batch.size": len(batch),
-                                        "documents.created": len(batch_doc_ids),
+                                        "points.created": len(batch_point_ids),
                                         "operation": "embedding_batch"
                                     }
                                 )
                                 
                                 # Force garbage collection after each batch
-                                del batch, batch_doc_ids
+                                del batch, batch_point_ids
                                 gc.collect()
                                 
                                 time.sleep(0.2)  # Increased sleep to prevent overload
@@ -592,7 +548,7 @@ class DocumentProcessor:
                 documents_processed.add(len(chunks), {"source": file_info.get("source", "unknown")})
                 
                 span.set_attributes({
-                    "documents_created": len(point_ids),
+                    "points_created": len(point_ids),
                     "result": "success"
                 })
                 
@@ -601,7 +557,7 @@ class DocumentProcessor:
                     extra_attributes={
                         "file.name": file_info.get("file_name"),
                         "chunks.processed": len(chunks),
-                        "documents.created": len(point_ids),
+                        "points.created": len(point_ids),
                         "operation": "process_documents",
                         "status": "success"
                     }
@@ -863,7 +819,7 @@ class BackendService:
                 file_hash = hashlib.md5(f"{file_id}_{file_name}_{mime_type}".encode()).hexdigest()
                 
                 if (self.fingerprint_db.is_file_processed(file_path, file_hash) or 
-                    self.fingerprint_db.is_file_in_elasticsearch(file_path, self.processor.elasticsearch_client)):
+                    self.fingerprint_db.is_file_in_qdrant(file_path, self.processor.qdrant_client)):
                     self.logger.debug_with_context(
                         "Skipping already processed Google Drive file",
                         extra_attributes={
@@ -1310,7 +1266,7 @@ class BackendService:
                         document_count=len(documents),
                         file_size=file_info["file_size"],
                         mime_type=file_info["mime_type"],
-                        qdrant_point_ids=point_ids  # Keep this field name for compatibility
+                        qdrant_point_ids=point_ids
                     )
                     
                     self.fingerprint_db.mark_file_processed(processed_file)
@@ -1321,7 +1277,7 @@ class BackendService:
                 
                 span.set_attributes({
                     "result": "success",
-                    "documents_created": len(point_ids)
+                    "points_created": len(point_ids)
                 })
                 
                 self.logger.info_with_context(
@@ -1329,17 +1285,7 @@ class BackendService:
                     extra_attributes={
                         "file.name": file_name,
                         "documents.count": len(documents),
-                        "documents.created": len(point_ids),
-                        "operation": "file_processing",
-                        "status": "success"
-                    }
-                )
-                self.logger.info_with_context(
-                    "File processing completed successfully",
-                    extra_attributes={
-                        "file.name": file_name,
-                        "documents.count": len(documents),
-                        "documents.created": len(point_ids),
+                        "points.created": len(point_ids),
                         "operation": "file_processing",
                         "status": "success"
                     }
@@ -1745,8 +1691,8 @@ class BackendService:
             "configuration": {
                 "google_drive_folder_id": self.google_drive_folder_id,
                 "local_watch_dirs": [],  # Disabled for safety
-                "elasticsearch_url": self.processor.elasticsearch_url,
-                "index_name": self.processor.index_name,
+                "qdrant_url": self.processor.qdrant_url,
+                "collection_name": self.processor.collection_name,
                 "embedding_model": self.processor.embedding_model,
                 "chunk_size": int(os.getenv("CHUNK_SIZE", "3000")),
                 "chunk_overlap": int(os.getenv("CHUNK_OVERLAP", "300")),
@@ -1813,38 +1759,36 @@ async def lifespan(app: FastAPI):
                     orchestrator_healthy = await service.check_orchestrator_health()
                     health_span.set_attribute("orchestrator.healthy", orchestrator_healthy)
                     
-                    # Test Elasticsearch during startup
-                    with tracer.start_as_current_span("startup_elasticsearch_test") as es_test_span:
-                        es_test_span.set_attributes({
+                    # Test Qdrant during startup
+                    with tracer.start_as_current_span("startup_qdrant_test") as qdrant_test_span:
+                        qdrant_test_span.set_attributes({
                             "service.name": "document-rag-backend",
-                            "peer.service": "elasticsearch-database",
-                            "external.service.name": "elasticsearch-database",
+                            "peer.service": "qdrant-database",
+                            "external.service.name": "qdrant-database",
                             "external.service.type": "vector_database",
-                            "db.system": "elasticsearch",
+                            "db.system": "qdrant",
                             "test.phase": "startup"
                         })
                         
                         try:
-                            cluster_health = service.processor.elasticsearch_client.cluster.health()
-                            es_test_span.set_attribute("elasticsearch.available", True)
-                            es_test_span.set_attribute("elasticsearch.status", cluster_health.get("status", "unknown"))
-                            es_test_span.set_attribute("elasticsearch.indices_count", cluster_health.get("number_of_indices", 0))
+                            collections = service.processor.qdrant_client.get_collections()
+                            qdrant_test_span.set_attribute("qdrant.available", True)
+                            qdrant_test_span.set_attribute("qdrant.collections_count", len(collections.collections))
                             
                             logger.info_with_context(
-                                "Elasticsearch connection verified at startup",
+                                "Qdrant connection verified at startup",
                                 extra_attributes={
-                                    "elasticsearch.status": cluster_health.get("status"),
-                                    "elasticsearch.indices": cluster_health.get("number_of_indices", 0),
+                                    "qdrant.collections": len(collections.collections),
                                     "operation": "startup_health_check"
                                 }
                             )
-                        except Exception as es_error:
-                            es_test_span.record_exception(es_error)
-                            es_test_span.set_attribute("elasticsearch.available", False)
+                        except Exception as qdrant_error:
+                            qdrant_test_span.record_exception(qdrant_error)
+                            qdrant_test_span.set_attribute("qdrant.available", False)
                             logger.warning_with_context(
-                                "Elasticsearch connection issue at startup",
+                                "Qdrant connection issue at startup",
                                 extra_attributes={
-                                    "error.message": str(es_error),
+                                    "error.message": str(qdrant_error),
                                     "operation": "startup_health_check"
                                 }
                             )

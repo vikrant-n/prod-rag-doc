@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced API Service Launcher with W3C Trace Propagation
-Updated for Elasticsearch support
+Middleware-based approach without decorators
 """
 
 import os
@@ -10,13 +10,9 @@ import time
 import signal
 import logging
 import asyncio
-import urllib3
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
-
-# Suppress SSL warnings for self-signed certificates
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Force service name early
 os.environ["OTEL_SERVICE_NAME"] = "document-rag-api"
@@ -35,7 +31,7 @@ from otel_config import (
 tracer, meter = initialize_opentelemetry("document-rag-api", "2.0.0", "production")
 
 class APIServiceLauncher:
-    """API service launcher with middleware-based tracing and Elasticsearch support"""
+    """API service launcher with middleware-based tracing"""
     
     def __init__(self):
         self.tracer = tracer
@@ -46,7 +42,7 @@ class APIServiceLauncher:
         # Extract parent context from environment if available
         parent_trace_id = os.getenv("OTEL_PARENT_TRACE_ID")
         if parent_trace_id:
-            print(f"Inheriting parent trace: {parent_trace_id[:8]}...")
+            print(f"🔗 Inheriting parent trace: {parent_trace_id[:8]}...")
     
     def check_environment(self) -> bool:
         """Environment validation with manual spans"""
@@ -62,88 +58,60 @@ class APIServiceLauncher:
             
             if missing:
                 span.set_attribute("validation.failed", True)
-                print(f"Missing required variables: {', '.join(missing)}")
+                print(f"❌ Missing required variables: {', '.join(missing)}")
                 return False
             
-            # Set defaults for Elasticsearch variables
-            os.environ.setdefault("ELASTICSEARCH_URL", "https://172.31.23.77:9200")
-            os.environ.setdefault("ELASTICSEARCH_USERNAME", "elastic")
-            os.environ.setdefault("ELASTICSEARCH_PASSWORD", "elastic")
-            os.environ.setdefault("ELASTICSEARCH_INDEX", "documents")
+            # Set defaults for optional variables
+            os.environ.setdefault("QDRANT_HOST", "localhost")
+            os.environ.setdefault("QDRANT_PORT", "6333")
+            os.environ.setdefault("COLLECTION_NAME", "documents")
             os.environ.setdefault("EMBEDDING_MODEL", "text-embedding-3-large")
             
             span.set_attribute("validation.passed", True)
-            print("Environment validation passed")
+            print("✅ Environment validation passed")
             return True
     
     def check_dependencies(self) -> bool:
-        """Check service dependencies with Elasticsearch support"""
+        """Check service dependencies with manual tracing"""
         with self.tracer.start_as_current_span("dependency_check") as span:
             dependencies_ok = True
             
-            # Check Elasticsearch
-            elasticsearch_url = os.getenv("ELASTICSEARCH_URL", "https://172.31.23.77:9200")
-            elasticsearch_username = os.getenv("ELASTICSEARCH_USERNAME", "elastic")
-            elasticsearch_password = os.getenv("ELASTICSEARCH_PASSWORD", "elastic")
-            elasticsearch_index = os.getenv("ELASTICSEARCH_INDEX", "documents")
+            # Check Qdrant
+            qdrant_host = os.getenv("QDRANT_HOST", "localhost")
+            qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
             
-            with self.tracer.start_as_current_span("check_elasticsearch") as es_span:
-                es_span.set_attributes({
-                    "elasticsearch.url": elasticsearch_url,
-                    "elasticsearch.username": elasticsearch_username,
-                    "elasticsearch.index": elasticsearch_index,
-                    "service.external": "elasticsearch-database"
+            with self.tracer.start_as_current_span("check_qdrant") as qdrant_span:
+                qdrant_span.set_attributes({
+                    "qdrant.host": qdrant_host,
+                    "qdrant.port": qdrant_port,
+                    "service.external": "qdrant-database"
                 })
                 
                 try:
-                    from elasticsearch import Elasticsearch
+                    from qdrant_client import QdrantClient
+                    client = QdrantClient(host=qdrant_host, port=qdrant_port, timeout=5.0)
+                    collections = client.get_collections()
                     
-                    client = Elasticsearch(
-                        [elasticsearch_url],
-                        basic_auth=(elasticsearch_username, elasticsearch_password),
-                        verify_certs=False,
-                        ssl_show_warn=False,
-                        request_timeout=10,
-                        retry_on_timeout=True,
-                        max_retries=2
-                    )
-                    
-                    # Test cluster health
-                    health = client.cluster.health()
-                    
-                    es_span.set_attributes({
-                        "elasticsearch.status": health.get("status", "unknown"),
-                        "elasticsearch.cluster_name": health.get("cluster_name", "unknown"),
-                        "elasticsearch.nodes": health.get("number_of_nodes", 0),
-                        "elasticsearch.indices": health.get("number_of_indices", 0)
+                    qdrant_span.set_attributes({
+                        "qdrant.status": "healthy",
+                        "qdrant.collections_count": len(collections.collections)
                     })
+                    print(f"✅ Qdrant accessible ({len(collections.collections)} collections)")
                     
-                    print(f"Elasticsearch accessible - Status: {health.get('status')}")
-                    print(f"Cluster: {health.get('cluster_name')} ({health.get('number_of_nodes')} nodes)")
-                    
-                    # Check documents index
+                    # Check documents collection
+                    collection_name = os.getenv("COLLECTION_NAME", "documents")
                     try:
-                        if client.indices.exists(index=elasticsearch_index):
-                            stats = client.indices.stats(index=elasticsearch_index)
-                            doc_count = stats['indices'][elasticsearch_index]['total']['docs']['count']
-                            size_bytes = stats['indices'][elasticsearch_index]['total']['store']['size_in_bytes']
-                            
-                            es_span.set_attributes({
-                                "elasticsearch.documents_count": doc_count,
-                                "elasticsearch.index_size_bytes": size_bytes
-                            })
-                            
-                            print(f"Index '{elasticsearch_index}' has {doc_count:,} documents ({size_bytes:,} bytes)")
-                        else:
-                            print(f"Index '{elasticsearch_index}' not found (will be created automatically)")
-                            
-                    except Exception as index_error:
-                        print(f"Could not check index status: {index_error}")
+                        collection_info = client.get_collection(collection_name)
+                        point_count = collection_info.points_count
+                        qdrant_span.set_attribute("qdrant.documents_count", point_count)
+                        print(f"📄 Collection '{collection_name}' has {point_count} documents")
+                    except Exception:
+                        print(f"⚠️ Collection '{collection_name}' not found")
                         
                 except Exception as e:
-                    es_span.record_exception(e)
-                    es_span.set_attribute("elasticsearch.status", "unreachable")
-                    print(f"Elasticsearch connection failed: {e}")
+                    qdrant_span.record_exception(e)
+                    qdrant_span.set_attribute("qdrant.status", "unreachable")
+                    print(f"⚠️ Qdrant connection failed: {e}")
                     dependencies_ok = False
             
             # Check OpenAI API
@@ -161,23 +129,15 @@ class APIServiceLauncher:
                             "openai.status": "healthy",
                             "openai.models_accessible": len(models.data)
                         })
-                        print("OpenAI API accessible")
-                        
-                        # Check if embedding model is available
-                        embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
-                        available_models = [model.id for model in models.data]
-                        if embedding_model in available_models:
-                            print(f"Embedding model '{embedding_model}' available")
-                        else:
-                            print(f"Warning: Embedding model '{embedding_model}' not found in available models")
+                        print("✅ OpenAI API accessible")
                     else:
                         openai_span.set_attribute("openai.status", "no_key")
-                        print("OpenAI API key missing")
+                        print("❌ OpenAI API key missing")
                         dependencies_ok = False
                         
                 except Exception as e:
                     openai_span.record_exception(e)
-                    print(f"OpenAI API check failed: {e}")
+                    print(f"⚠️ OpenAI API check failed: {e}")
                     dependencies_ok = False
             
             # Check backend service with proper context injection
@@ -202,13 +162,13 @@ class APIServiceLauncher:
                     backend_span.set_attribute("backend.status", "healthy" if backend_healthy else "unhealthy")
                     
                     if backend_healthy:
-                        print(f"Backend service accessible at {backend_url}")
+                        print(f"✅ Backend service accessible at {backend_url}")
                     else:
-                        print(f"Backend service not responding properly")
+                        print(f"⚠️ Backend service not responding properly")
                         
                 except Exception as e:
                     backend_span.record_exception(e)
-                    print(f"Backend service check failed: {e}")
+                    print(f"⚠️ Backend service check failed: {e}")
             
             span.set_attribute("dependencies.all_ok", dependencies_ok)
             return dependencies_ok
@@ -222,8 +182,8 @@ class APIServiceLauncher:
                     "shutdown.trace_id": get_current_trace_id()
                 })
                 
-                print("\nGraceful shutdown initiated for API service")
-                print(f"Final Trace ID: {get_current_trace_id()}")
+                print("\n🛑 Graceful shutdown initiated for API service")
+                print(f"🆔 Final Trace ID: {get_current_trace_id()}")
                 
                 # Shutdown OpenTelemetry
                 from otel_config import shutdown_opentelemetry
@@ -242,11 +202,10 @@ class APIServiceLauncher:
                 "service.host": self.host,
                 "service.port": self.port,
                 "service.parent": "document-rag-orchestrator",
-                "w3c.propagation": "enabled",
-                "vector_database": "elasticsearch"
+                "w3c.propagation": "enabled"
             })
             
-            print("Starting Enhanced Document RAG API Service")
+            print("🚀 Starting Enhanced Document RAG API Service")
             print("=" * 65)
             
             # Environment validation
@@ -257,7 +216,7 @@ class APIServiceLauncher:
             # Dependencies check
             deps_ok = self.check_dependencies()
             if not deps_ok:
-                print("Some dependencies unavailable - continuing with reduced functionality")
+                print("⚠️ Some dependencies unavailable - continuing with reduced functionality")
             
             # Setup signal handlers
             self.setup_signal_handlers()
@@ -268,37 +227,34 @@ class APIServiceLauncher:
             
             # Display service information
             print()
-            print("API Service Ready!")
-            print("W3C Trace Propagation: ENABLED")
-            print("Service Map: ACTIVE")
-            print("Vector Database: Elasticsearch")
+            print("✅ API Service Ready!")
+            print("🔗 W3C Trace Propagation: ENABLED")
+            print("🗺️ Service Map: ACTIVE")
             print()
-            print("Service Configuration:")
-            print(f"   Host: {self.host}")
-            print(f"   Port: {self.port}")
-            print(f"   Service: {self.service_name}")
-            print(f"   Parent: document-rag-orchestrator")
-            print(f"   Middleware: TraceContextMiddleware")
-            print(f"   Elasticsearch: {os.getenv('ELASTICSEARCH_URL')}")
-            print(f"   Index: {os.getenv('ELASTICSEARCH_INDEX')}")
+            print("🌐 Service Configuration:")
+            print(f"   📍 Host: {self.host}")
+            print(f"   🔌 Port: {self.port}")
+            print(f"   🆔 Service: {self.service_name}")
+            print(f"   📊 Parent: document-rag-orchestrator")
+            print(f"   🔗 Middleware: TraceContextMiddleware")
             
             # Service hierarchy
             hierarchy_info = SERVICE_HIERARCHY.get(self.service_name, {})
             children = hierarchy_info.get("children", [])
             if children:
-                print(f"   Components: {', '.join(children)}")
+                print(f"   🧩 Components: {', '.join(children)}")
             
             print()
-            print("API Endpoints:")
-            print(f"   Main UI:           http://{self.host}:{self.port}")
-            print(f"   API Docs:          http://{self.host}:{self.port}/docs")
-            print(f"   Query API:         http://{self.host}:{self.port}/api/query")
-            print(f"   Health Check:      http://{self.host}:{self.port}/api/health")
-            print(f"   Service Map:       http://{self.host}:{self.port}/api/service-map")
+            print("🌐 API Endpoints:")
+            print(f"   📊 Main UI:           http://{self.host}:{self.port}")
+            print(f"   📚 API Docs:          http://{self.host}:{self.port}/docs")
+            print(f"   🔍 Query API:         http://{self.host}:{self.port}/api/query")
+            print(f"   💊 Health Check:      http://{self.host}:{self.port}/api/health")
+            print(f"   🗺️  Service Map:       http://{self.host}:{self.port}/api/service-map")
             
             print()
-            print(f"Startup Trace ID: {get_current_trace_id()}")
-            print(f"OTLP Endpoint: {os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT')}")
+            print(f"🆔 Startup Trace ID: {get_current_trace_id()}")
+            print(f"📡 OTLP Endpoint: {os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT')}")
             print("=" * 65)
             
             # Start FastAPI server
@@ -309,11 +265,10 @@ class APIServiceLauncher:
                     uvicorn_span.set_attributes({
                         "uvicorn.host": self.host,
                         "uvicorn.port": self.port,
-                        "uvicorn.app": "ui.api_integrated_clean:app",
-                        "vector_database": "elasticsearch"
+                        "uvicorn.app": "ui.api_integrated_clean:app"
                     })
                     
-                    print("Starting FastAPI server with middleware...")
+                    print("🔥 Starting FastAPI server with middleware...")
                     
                     # CRITICAL: This will use the middleware from api_integrated_clean.py
                     uvicorn.run(
@@ -331,7 +286,7 @@ class APIServiceLauncher:
             except Exception as e:
                 span.record_exception(e)
                 span.set_attribute("startup.failed", True)
-                print(f"Failed to start API service: {e}")
+                print(f"❌ Failed to start API service: {e}")
                 return False
 
 def main():
@@ -349,8 +304,7 @@ def main():
             "startup.mode": "launcher",
             "startup.parent_trace_id": parent_trace_id or "none",
             "startup.w3c_propagation": True,
-            "service.hierarchy": f"{parent_service} -> document-rag-api",
-            "vector_database": "elasticsearch"
+            "service.hierarchy": f"{parent_service} -> document-rag-api"
         })
         
         launcher = APIServiceLauncher()
@@ -360,26 +314,25 @@ def main():
             
             if not success:
                 main_span.set_attribute("startup.result", "failed")
-                print("API service startup failed")
+                print("❌ API service startup failed")
                 sys.exit(1)
             
             main_span.set_attribute("startup.result", "success")
             
         except KeyboardInterrupt:
             main_span.add_event("shutdown_requested")
-            print("\nShutdown signal received")
+            print("\n🔄 Shutdown signal received")
         except Exception as e:
             main_span.record_exception(e)
             main_span.set_attribute("startup.result", "error")
-            print(f"API service error: {e}")
+            print(f"❌ API service error: {e}")
             sys.exit(1)
 
 if __name__ == "__main__":
-    print("ENHANCED API SERVICE LAUNCHER")
-    print("W3C Trace Context Propagation: ENABLED")
-    print("Service Hierarchy: orchestrator → api → components")
-    print("Middleware-Based Trace Continuity: ACTIVE")
-    print("Vector Database: Elasticsearch with Authentication")
+    print("🔥 ENHANCED API SERVICE LAUNCHER")
+    print("🌐 W3C Trace Context Propagation: ENABLED")
+    print("📊 Service Hierarchy: orchestrator → api → components")
+    print("🗺️ Middleware-Based Trace Continuity: ACTIVE")
     print()
     
     main()
