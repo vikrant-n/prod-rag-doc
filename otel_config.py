@@ -330,6 +330,19 @@ def _setup_correlated_logging(log_provider: LoggerProvider):
     # Prevent duplicate logs
     root_logger.propagate = False
 
+def elasticsearch_request_hook(span, method, url, params, body, headers):
+    """Hook to add custom attributes to Elasticsearch requests"""
+    span.set_attribute("elasticsearch.method", method)
+    span.set_attribute("elasticsearch.url", url)
+    if params:
+        span.set_attribute("elasticsearch.params", str(params))
+
+def elasticsearch_response_hook(span, response):
+    """Hook to add response information to Elasticsearch spans"""
+    if hasattr(response, 'status_code'):
+        span.set_attribute("http.status_code", response.status_code)
+
+
 def _setup_enhanced_auto_instrumentation():
     """Setup enhanced automatic instrumentation for common libraries - FIXED"""
     try:
@@ -358,35 +371,32 @@ def _setup_enhanced_auto_instrumentation():
     except Exception as e:
         print(f"⚠️  HTTPX instrumentation warning: {e}")
     
+    # FIX: Properly configure Elasticsearch instrumentation
     try:
-        # CRITICAL FIX: Add Elasticsearch instrumentation
         from opentelemetry.instrumentation.elasticsearch import ElasticsearchInstrumentor
-        ElasticsearchInstrumentor().instrument()
-        print("✅ Elasticsearch instrumentation enabled")
+        
+        # Enable Elasticsearch instrumentation explicitly
+        ElasticsearchInstrumentor().instrument(
+            request_hook=None,  # Optional: add request hooks
+            response_hook=None,  # Optional: add response hooks
+        )
+        
+        # Set environment variable to ensure instrumentation is enabled
+        os.environ["OTEL_INSTRUMENTATION_ELASTICSEARCH_ENABLED"] = "true"
+        os.environ["OTEL_INSTRUMENTATION_ELASTICSEARCH_CAPTURE_SEARCH_QUERY"] = "true"
+        
+        print("✅ Elasticsearch instrumentation enabled with search query capture")
     except ImportError:
-        print("⚠️  Elasticsearch instrumentation not available - install opentelemetry-instrumentation-elasticsearch")
+        print("❌ Elasticsearch instrumentation not available - installing...")
+        # Install the missing package
+        import subprocess
+        subprocess.check_call([
+            "pip", "install", "opentelemetry-instrumentation-elasticsearch"
+        ])
+        print("✅ Elasticsearch instrumentation installed - restart required")
     except Exception as e:
         print(f"⚠️  Elasticsearch instrumentation warning: {e}")
-    
-    try:
-        # CRITICAL FIX: Add urllib3 instrumentation for better HTTP tracking
-        from opentelemetry.instrumentation.urllib3 import URLLib3Instrumentor
-        URLLib3Instrumentor().instrument()
-        print("✅ urllib3 instrumentation enabled")
-    except ImportError:
-        print("⚠️  urllib3 instrumentation not available - install opentelemetry-instrumentation-urllib3")
-    except Exception as e:
-        print(f"⚠️  urllib3 instrumentation warning: {e}")
-    
-    try:
-        # CRITICAL FIX: Add SQLite instrumentation for database tracking
-        from opentelemetry.instrumentation.sqlite3 import SQLite3Instrumentor
-        SQLite3Instrumentor().instrument()
-        print("✅ SQLite3 instrumentation enabled")
-    except ImportError:
-        print("⚠️  SQLite3 instrumentation not available - install opentelemetry-instrumentation-sqlite3")
-    except Exception as e:
-        print(f"⚠️  SQLite3 instrumentation warning: {e}")
+
 
 def _initialize_global_providers(resource: Resource):
     """Initialize global trace, metric, AND log providers with enhanced configuration"""

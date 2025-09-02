@@ -393,16 +393,27 @@ class DocumentProcessor:
         )
         
         # FIXED: Use manual spans for Elasticsearch operations to avoid instrumentation warnings
-        self.logger.info_with_context(
-            "Using manual spans for Elasticsearch operations",
-            extra_attributes={
-                "elasticsearch.url": self.elasticsearch_url,
-                "instrumentation.type": "manual_spans",
-                "operation": "elasticsearch_instrumentation"
+        self.elasticsearch_client = Elasticsearch(
+            [self.elasticsearch_url],
+            basic_auth=(self.elasticsearch_username, self.elasticsearch_password),
+            verify_certs=False,
+            ssl_show_warn=False,  # Only suppress SSL warnings, not instrumentation
+            request_timeout=30,
+            retry_on_timeout=True,
+            max_retries=3,
+            # CRITICAL: Add these for proper instrumentation
+            headers={
+                "User-Agent": "document-rag-backend/2.0.0"
             }
         )
         
-        self.vector_store = None
+        self.vector_store = ElasticsearchStore(
+            es_connection=self.elasticsearch_client,
+            index_name=self.index_name,
+            embedding=self.embeddings,
+            vector_query_field="vector",
+            query_field="text"
+        )
         
         # Initialize index
         self._ensure_index_exists()
@@ -524,158 +535,119 @@ class DocumentProcessor:
             raise
     
     def process_documents(self, documents: List[Document], file_info: Dict) -> List[str]:
-        """Process documents and add to Qdrant with complete tracing"""
-        with self.tracer.start_as_current_span("process_documents") as span:
+        """Process documents with PROPER trace context propagation"""
+        with self.tracer.start_as_current_span("process_documents_elasticsearch") as main_span:
             try:
-                span.set_attributes({
+                # Set comprehensive span attributes
+                main_span.set_attributes({
                     "service.name": "document-rag-backend",
-                    "service.version": "2.0.0",
-                    "file_name": file_info.get("file_name", "unknown"),
-                    "document_count": len(documents),
-                    "file_source": file_info.get("source", "unknown"),
-                    "operation.name": "process_documents"
+                    "operation.name": "process_documents",
+                    "file.name": file_info.get("file_name", "unknown"),
+                    "document.count": len(documents),
+                    "vector.database": "elasticsearch",
+                    "elasticsearch.index": self.index_name
                 })
                 
                 if not documents:
-                    span.set_attribute("result", "no_documents")
+                    main_span.set_attribute("result", "no_documents")
                     return []
                 
-                # Split documents into chunks using environment variables
-                chunk_size = int(os.getenv("CHUNK_SIZE", "3000"))
-                chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "300"))
-                
+                # Document splitting with context preservation
                 with self.tracer.start_as_current_span("document_splitting") as split_span:
-                    split_span.set_attributes({
-                        "service.name": "document-rag-backend",
-                        "operation.name": "document_splitting",
-                        "chunk_size": chunk_size,
-                        "chunk_overlap": chunk_overlap
-                    })
+                    chunk_size = int(os.getenv("CHUNK_SIZE", "3000"))
+                    chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "300"))
+                    
                     chunks = split_documents(documents, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-                    split_span.set_attribute("chunks_created", len(chunks))
+                    split_span.set_attributes({
+                        "chunks.created": len(chunks),
+                        "chunk.size": chunk_size,
+                        "chunk.overlap": chunk_overlap
+                    })
                     
-                    # Force garbage collection after document splitting
-                    del documents
+                    del documents  # Memory cleanup
                     gc.collect()
-                    
-                    self.logger.info_with_context(
-                        "Documents split into chunks",
-                        extra_attributes={
-                            "file.name": file_info.get("file_name"),
-                            "chunks.created": len(chunks),
-                            "chunk.size": chunk_size,
-                            "chunk.overlap": chunk_overlap,
-                            "operation": "document_splitting"
-                        }
-                    )
                 
                 if not chunks:
-                    span.set_attribute("result", "no_chunks")
+                    main_span.set_attribute("result", "no_chunks")
                     return []
                 
-                # Add metadata with trace correlation
-                trace_id = span.get_span_context().trace_id
+                # CRITICAL: Add trace context to chunk metadata
+                current_trace_id = format(main_span.get_span_context().trace_id, '032x')
                 for chunk in chunks:
                     chunk.metadata.update({
+                        "trace_id": current_trace_id,
+                        "processing_service": "document-rag-backend",
                         "file_id": file_info.get("file_id", "unknown"),
                         "file_name": file_info.get("file_name", "unknown"),
-                        "file_path": file_info.get("file_path", "unknown"),
-                        "processed_at": datetime.now().isoformat(),
-                        "file_size": file_info.get("file_size", 0),
-                        "mime_type": file_info.get("mime_type", "unknown"),
-                        "trace_id": format(trace_id, '032x'),
-                        "processing_service": "document-rag-backend"
+                        "processed_at": datetime.now().isoformat()
                     })
                 
-                # Generate embeddings and add to Qdrant
+                # Process in batches with proper context propagation
                 point_ids = []
                 batch_size = int(os.getenv("BATCH_SIZE", "5"))
                 
-                with self.tracer.start_as_current_span("embedding_generation") as embed_span:
-                    embed_span.set_attributes({
-                        "service.name": "document-rag-backend",
-                        "peer.service": "openai-api",
-                        "external.service.name": "openai-api",
-                        "external.service.type": "embedding_api",
-                        "ai.model.name": self.embedding_model,
-                        "batch_size": batch_size
-                    })
-                    
+                with self.tracer.start_as_current_span("elasticsearch_batch_processing") as batch_parent_span:
                     for i in range(0, len(chunks), batch_size):
                         batch = chunks[i:i + batch_size]
                         
-                        with self.tracer.start_as_current_span("embedding_batch") as batch_span:
+                        # CRITICAL: Each batch operation gets its own span under parent context
+                        with self.tracer.start_as_current_span(f"elasticsearch_batch_{i//batch_size + 1}") as batch_span:
                             batch_span.set_attributes({
-                                "service.name": "document-rag-backend",
-                                "batch_number": i//batch_size + 1,
-                                "batch_size": len(batch),
-                                "file_name": file_info.get("file_name", "unknown")
+                                "batch.number": i//batch_size + 1,
+                                "batch.size": len(batch),
+                                "elasticsearch.operation": "add_documents",
+                                "elasticsearch.index": self.index_name
                             })
                             
                             try:
-                                # Generate unique document IDs
+                                # Generate batch IDs
                                 batch_doc_ids = [
                                     hashlib.md5(f"{file_info['file_path']}_{i+j}_{chunk.page_content[:100]}".encode()).hexdigest()
                                     for j, chunk in enumerate(batch)
                                 ]
                                 
-                                # Add to vector store with Elasticsearch tracing
-                                with self.tracer.start_as_current_span("elasticsearch_store_documents") as es_span:
-                                    es_span.set_attributes({
-                                        "service.name": "document-rag-backend",
-                                        "peer.service": "elasticsearch-database",
-                                        "external.service.name": "elasticsearch-database",
-                                        "external.service.type": "vector_database",
-                                        "db.system": "elasticsearch",
-                                        "db.operation": "add_documents",
-                                        "db.collection.name": self.index_name,
-                                        "db.connection_string": self.elasticsearch_url
-                                    })
-                                    
-                                    self.vector_store.add_documents(batch, ids=batch_doc_ids)
-                                    point_ids.extend(batch_doc_ids)
-                                    
-                                    # Track external API call
-                                    external_api_calls.add(1, {"service": "elasticsearch-database", "operation": "add_documents"})
+                                # CRITICAL: The instrumented Elasticsearch client will now automatically
+                                # create child spans for each operation
+                                self.vector_store.add_documents(batch, ids=batch_doc_ids)
+                                point_ids.extend(batch_doc_ids)
                                 
-                                batch_span.set_attribute("documents_created", len(batch_doc_ids))
+                                batch_span.set_attributes({
+                                    "documents.created": len(batch_doc_ids),
+                                    "batch.status": "success"
+                                })
                                 
-                                self.logger.debug_with_context(
-                                    "Processed embedding batch",
+                                self.logger.info_with_context(
+                                    f"Processed batch {i//batch_size + 1} successfully",
                                     extra_attributes={
                                         "batch.number": i//batch_size + 1,
-                                        "batch.size": len(batch),
                                         "documents.created": len(batch_doc_ids),
-                                        "operation": "embedding_batch"
+                                        "elasticsearch.index": self.index_name
                                     }
                                 )
                                 
-                                # Force garbage collection after each batch
-                                del batch, batch_doc_ids
-                                gc.collect()
-                                
-                                time.sleep(0.2)  # Increased sleep to prevent overload
-                                
                             except Exception as batch_error:
                                 batch_span.record_exception(batch_error)
+                                batch_span.set_attribute("batch.status", "failed")
                                 self.logger.error_with_context(
-                                    "Error processing batch",
+                                    f"Batch {i//batch_size + 1} failed",
                                     extra_attributes={
                                         "batch.number": i//batch_size + 1,
-                                        "error.type": type(batch_error).__name__,
-                                        "error.message": str(batch_error),
-                                        "operation": "embedding_batch"
+                                        "error.message": str(batch_error)
                                     },
                                     exc_info=True
                                 )
-                                # Continue with next batch instead of failing completely
                                 continue
+                            finally:
+                                del batch, batch_doc_ids
+                                gc.collect()
+                            
+                            time.sleep(0.2)  # Rate limiting
                 
-                # Update metrics
-                documents_processed.add(len(chunks), {"source": file_info.get("source", "unknown")})
-                
-                span.set_attributes({
-                    "documents_created": len(point_ids),
+                # Update metrics and final span attributes
+                documents_processed.add(len(chunks), {"database": "elasticsearch"})
+                main_span.set_attributes({
+                    "documents.processed": len(chunks),
+                    "documents.created": len(point_ids),
                     "result": "success"
                 })
                 
@@ -685,36 +657,29 @@ class DocumentProcessor:
                         "file.name": file_info.get("file_name"),
                         "chunks.processed": len(chunks),
                         "documents.created": len(point_ids),
-                        "operation": "process_documents",
-                        "status": "success"
+                        "elasticsearch.index": self.index_name
                     }
                 )
-                
-                # Final cleanup
-                del chunks
-                gc.collect()
                 
                 return point_ids
                 
             except Exception as e:
-                span.record_exception(e)
-                span.set_status(Status(StatusCode.ERROR, str(e)))
-                processing_errors.add(1, {"operation": "document_processing"})
+                main_span.record_exception(e)
+                main_span.set_status(Status(StatusCode.ERROR, str(e)))
+                processing_errors.add(1, {"operation": "elasticsearch_processing"})
                 
                 self.logger.error_with_context(
                     "Document processing failed",
                     extra_attributes={
                         "file.name": file_info.get("file_name"),
                         "error.type": type(e).__name__,
-                        "error.message": str(e),
-                        "operation": "process_documents",
-                        "status": "failed"
+                        "error.message": str(e)
                     },
                     exc_info=True
                 )
-                # Cleanup on error
-                gc.collect()
                 raise
+            finally:
+                gc.collect()
 
 
 class BackendService:
