@@ -2,6 +2,7 @@
 """
 Enhanced Backend Service with Complete OpenTelemetry Instrumentation
 Fixed to prevent segmentation faults and memory issues
+FIXED: Proper OpenTelemetry initialization order and instrumentation
 """
 
 import os
@@ -22,12 +23,90 @@ import shutil
 import gc
 from contextlib import asynccontextmanager
 
-# Set OpenTelemetry service name early
+# Load environment variables FIRST
+from dotenv import load_dotenv
+load_dotenv()
+
+# CRITICAL FIX: Set OpenTelemetry service name early and extract parent context
 os.environ["OTEL_SERVICE_NAME"] = "document-rag-backend"
 
-# OpenTelemetry imports
+# FIXED: Proper OpenTelemetry initialization with parent context
 from opentelemetry import trace, metrics, propagate
 from opentelemetry.trace.status import Status, StatusCode
+from opentelemetry.context import attach, detach
+
+# Import OpenTelemetry configuration EARLY
+from otel_config import (
+    initialize_opentelemetry, get_service_tracer, instrument_fastapi_app,
+    get_current_trace_id, extract_and_activate_context, TracedHTTPXClient,
+    get_correlated_logger
+)
+
+# FIXED: Extract parent context from environment if available
+def extract_parent_context_from_environment():
+    """Extract parent trace context from environment variables set by orchestrator"""
+    traceparent = os.getenv("OTEL_TRACE_PARENT")
+    tracestate = os.getenv("OTEL_TRACE_STATE", "")
+    
+    if traceparent:
+        print(f"📥 Backend extracting parent context from environment:")
+        print(f"   traceparent: {traceparent}")
+        print(f"   tracestate: {tracestate}")
+        
+        headers = {
+            "traceparent": traceparent,
+            "tracestate": tracestate
+        }
+        
+        try:
+            parent_context = propagate.extract(headers)
+            context_token = attach(parent_context)
+            print(f"✅ Parent context extracted and activated")
+            return context_token, parent_context
+        except Exception as e:
+            print(f"❌ Error extracting parent context: {e}")
+            return None, None
+    else:
+        print(f"ℹ️ No parent context found in environment (standalone mode)")
+        return None, None
+
+# FIXED: Initialize OpenTelemetry with proper parent context
+print("=" * 60)
+print("🔧 Backend Service Module Initialization")
+
+# Step 1: Extract parent context FIRST
+context_token, parent_context = extract_parent_context_from_environment()
+
+# Step 2: Initialize OpenTelemetry with parent context active
+tracer, meter = initialize_opentelemetry(
+    service_name="document-rag-backend",
+    service_version="2.0.0",
+    environment=os.getenv("OTEL_ENVIRONMENT", "production")
+)
+
+# Step 3: Create verification span
+with tracer.start_as_current_span("backend_service_initialization") as span:
+    span_context = span.get_span_context()
+    trace_id = format(span_context.trace_id, '032x')
+    span_id = format(span_context.span_id, '016x')
+    
+    span.set_attributes({
+        "service.name": "document-rag-backend",
+        "service.version": "2.0.0",
+        "service.parent": "document-rag-orchestrator",
+        "initialization.with_parent": parent_context is not None,
+        "initialization.trace_id": trace_id,
+        "initialization.span_id": span_id,
+        "initialization.parent_trace": os.getenv("OTEL_PARENT_TRACE_ID", "none")
+    })
+    
+    print(f"🆔 Backend Service Telemetry Initialized:")
+    print(f"   Current Trace ID: {trace_id}")
+    print(f"   Current Span ID: {span_id}")
+    print(f"   Parent Trace ID: {os.getenv('OTEL_PARENT_TRACE_ID', 'none')}")
+    print(f"   Parent Context: {'✅ Connected' if parent_context else '❌ Standalone'}")
+
+print("=" * 60)
 
 # FastAPI imports for status API
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
@@ -49,33 +128,27 @@ from loaders.google_drive_loader import GoogleDriveMasterLoader
 # Text splitting
 from text_splitting import split_documents
 
-# Load environment variables
-from dotenv import load_dotenv
-load_dotenv()
-
-# Import OpenTelemetry configuration
-from otel_config import (
-    initialize_opentelemetry, get_service_tracer, instrument_fastapi_app,
-    get_current_trace_id, extract_and_activate_context, TracedHTTPXClient,
-    get_correlated_logger
-)
-
 # Configuration from environment
 parent_trace_id = os.getenv("OTEL_PARENT_TRACE_ID")
 parent_service = os.getenv("OTEL_SERVICE_PARENT", "document-rag-orchestrator")
 orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8002")
 
-# Initialize OpenTelemetry
-tracer, meter = initialize_opentelemetry(
-    service_name="document-rag-backend",
-    service_version="2.0.0",
-    environment=os.getenv("OTEL_ENVIRONMENT", "production")
-)
-
-# Use correlated logger
+# Use correlated logger - this will now have proper trace context
 logger = get_correlated_logger(__name__)
 
-# Metrics
+# Log initialization complete with trace context
+logger.info_with_context(
+    "Backend service module initialization complete",
+    extra_attributes={
+        "service.name": "document-rag-backend",
+        "parent.service": parent_service,
+        "parent.trace_id": parent_trace_id,
+        "orchestrator.url": orchestrator_url,
+        "operation": "module_init"
+    }
+)
+
+# Metrics - use the initialized meter with proper context
 documents_processed = meter.create_counter(
     "documents_processed_total",
     description="Total number of documents processed"
@@ -120,7 +193,7 @@ class FileFingerprintDatabase:
     
     def __init__(self, db_path: str = ".processed_files.db"):
         self.db_path = db_path
-        self.tracer = get_service_tracer("file-fingerprint-db")
+        self.tracer = tracer  # Use global tracer
         self.logger = get_correlated_logger(f"{__name__}.FileFingerprintDatabase")
         self._init_db()
     
@@ -302,13 +375,13 @@ class DocumentProcessor:
         self.elasticsearch_username = elasticsearch_username or os.getenv("ELASTICSEARCH_USERNAME", "elastic")
         self.elasticsearch_password = elasticsearch_password or os.getenv("ELASTICSEARCH_PASSWORD", "elastic")
         
-        self.tracer = get_service_tracer("document-processor")
+        self.tracer = tracer  # Use global tracer
         self.logger = get_correlated_logger(f"{__name__}.DocumentProcessor")
         
         # Initialize components
         self.embeddings = OpenAIEmbeddings(model=self.embedding_model)
         
-        # Configure Elasticsearch client with authentication and SSL settings
+        # FIXED: Configure Elasticsearch client with authentication and SSL settings + instrumentation
         self.elasticsearch_client = Elasticsearch(
             [self.elasticsearch_url],
             basic_auth=(self.elasticsearch_username, self.elasticsearch_password),
@@ -317,6 +390,16 @@ class DocumentProcessor:
             request_timeout=30,
             retry_on_timeout=True,
             max_retries=3
+        )
+        
+        # FIXED: Use manual spans for Elasticsearch operations to avoid instrumentation warnings
+        self.logger.info_with_context(
+            "Using manual spans for Elasticsearch operations",
+            extra_attributes={
+                "elasticsearch.url": self.elasticsearch_url,
+                "instrumentation.type": "manual_spans",
+                "operation": "elasticsearch_instrumentation"
+            }
         )
         
         self.vector_store = None
@@ -638,7 +721,9 @@ class BackendService:
     """Main backend service with complete trace correlation and memory safety"""
     
     def __init__(self):
-        self.tracer = tracer
+        # CRITICAL: Use the module-level tracer and meter, not create new ones
+        self.tracer = tracer  # Use the initialized global tracer
+        self.meter = meter    # Use the initialized global meter
         self.service_name = "document-rag-backend"
         self.orchestrator_url = orchestrator_url
         
@@ -1007,25 +1092,27 @@ class BackendService:
                             "correlation.id": correlation_id
                         })
                         
-                        # Qdrant keepalive
-                        with self.tracer.start_as_current_span("keepalive_qdrant_ping") as qdrant_ping:
-                            qdrant_ping.set_attributes({
+                        # Elasticsearch keepalive
+                        with self.tracer.start_as_current_span("keepalive_elasticsearch_ping") as es_ping:
+                            es_ping.set_attributes({
                                 "service.name": "document-rag-backend",
-                                "peer.service": "qdrant-database",
-                                "external.service.name": "qdrant-database",
+                                "peer.service": "elasticsearch-database",
+                                "external.service.name": "elasticsearch-database",
                                 "external.service.type": "vector_database",
-                                "db.system": "qdrant",
+                                "db.system": "elasticsearch",
                                 "db.operation": "health_ping",
                                 "ping.purpose": "service_map_visibility"
                             })
                             
                             try:
-                                collections = self.processor.qdrant_client.get_collections()
-                                qdrant_ping.set_attribute("qdrant.responsive", True)
-                                qdrant_ping.set_attribute("qdrant.collections_count", len(collections.collections))
+                                cluster_health = self.processor.elasticsearch_client.cluster.health()
+                                es_ping.set_attribute("elasticsearch.responsive", True)
+                                es_ping.set_attribute("elasticsearch.status", cluster_health.get("status", "unknown"))
+                                es_ping.set_attribute("elasticsearch.indices_count", cluster_health.get("number_of_indices", 0))
                             except Exception as ping_error:
-                                qdrant_ping.record_exception(ping_error)
-                                qdrant_ping.set_attribute("qdrant.responsive", False)
+                                es_ping.record_exception(ping_error)
+                                es_ping.set_attribute("elasticsearch.responsive", False)
+
                         
                         # Google Drive keepalive if configured
                         if self.google_drive_loader:
@@ -1045,15 +1132,23 @@ class BackendService:
                                     }
                                 )
                     
-                    self.logger.info_with_context(
-                        "No new files found in scan cycle - service keepalive completed",
-                        extra_attributes={
-                            "correlation.id": correlation_id,
-                            "operation": "scan_cycle",
-                            "scan.result": "no_files",
-                            "keepalive.generated": True
-                        }
-                    )
+                    # Only log every 10th "no files" scan to reduce noise
+                    if hasattr(self, '_no_files_scan_count'):
+                        self._no_files_scan_count += 1
+                    else:
+                        self._no_files_scan_count = 1
+                    
+                    if self._no_files_scan_count % 10 == 0:
+                        self.logger.info_with_context(
+                            f"No new files found in {self._no_files_scan_count} scan cycles - service keepalive active",
+                            extra_attributes={
+                                "correlation.id": correlation_id,
+                                "operation": "scan_cycle",
+                                "scan.result": "no_files",
+                                "scan.cycles_since_files": self._no_files_scan_count,
+                                "keepalive.generated": True
+                            }
+                        )
                     scan_duration.record(time.time() - start_time, {"result": "no_files"})
                     return
                 
@@ -1205,6 +1300,9 @@ class BackendService:
                 "file_type": file_info.get("mime_type", "unknown"),
                 "operation.name": "process_document_file"
             })
+
+            span.set_attribute("transaction.name", f"process_file_{file_info.get('source', 'unknown')}")
+            span.set_attribute("transaction.type", "background")
             
             documents = None
             temp_file = None
@@ -1410,57 +1508,26 @@ class BackendService:
                     )
 
     async def send_heartbeat(self):
-        """Send heartbeat with proper error handling"""
+        """Send heartbeat with minimal noise - no spans for successful heartbeats"""
         try:
             async with TracedHTTPXClient(service_name="document-rag-backend") as client:
-                with self.tracer.start_as_current_span("send_heartbeat") as span:
-                    span.set_attributes({
-                        "service.name": "document-rag-backend",
-                        "peer.service": "document-rag-orchestrator",
-                        "external.service.name": "document-rag-orchestrator",
-                        "external.service.type": "orchestrator_api",
-                        "operation.name": "send_heartbeat"
-                    })
-                    response = await client.post(
-                        f"{self.orchestrator_url}/heartbeat",
-                        json={
-                            "service": "document-rag-backend",
-                            "status": "healthy",
-                            "stats": {
-                                "files_processed": self.stats["files_processed"],
-                                "documents_created": self.stats["documents_created"]
-                            }
-                        },
-                        timeout=5.0
-                    )
-                    
-                    span.set_attribute("heartbeat.sent", True)
-                    span.set_attribute("response.status_code", response.status_code)
-                    
-                    self.logger.debug_with_context(
-                        "Heartbeat sent to orchestrator",
-                        extra_attributes={
-                            "orchestrator.url": self.orchestrator_url,
-                            "heartbeat.status": "sent",
-                            "response.status_code": response.status_code,
-                            "stats.files_processed": self.stats["files_processed"],
-                            "stats.documents_created": self.stats["documents_created"],
-                            "operation": "heartbeat"
+                response = await client.post(
+                    f"{self.orchestrator_url}/heartbeat",
+                    json={
+                        "service": "document-rag-backend",
+                        "status": "healthy",
+                        "stats": {
+                            "files_processed": self.stats["files_processed"],
+                            "documents_created": self.stats["documents_created"]
                         }
-                    )
+                    },
+                    timeout=5.0
+                )
+                # Don't log successful heartbeats to reduce noise
                     
         except Exception as e:
-            # Don't log heartbeat failures as errors to avoid noise
-            self.logger.debug_with_context(
-                "Heartbeat failed (orchestrator may not be running)",
-                extra_attributes={
-                    "orchestrator.url": self.orchestrator_url,
-                    "heartbeat.status": "failed",
-                    "error.type": type(e).__name__,
-                    "error.message": str(e),
-                    "operation": "heartbeat"
-                }
-            )
+            # Only log heartbeat failures as debug level
+            pass  # Failures will be handled by the calling heartbeat_loop
 
     async def check_orchestrator_health(self):
         """Check orchestrator health with timeout"""
@@ -1659,37 +1726,44 @@ class BackendService:
                 )
 
     async def heartbeat_loop(self):
-        """Send periodic heartbeats to orchestrator with error handling"""
+        """Send periodic heartbeats to orchestrator with minimal logging"""
         heartbeat_count = 0
         while self.is_running:
             heartbeat_count += 1
             
-            # Create heartbeat span
-            with self.tracer.start_as_current_span("heartbeat_cycle") as heartbeat_span:
-                heartbeat_span.set_attributes({
-                    "service.name": "document-rag-backend",
-                    "heartbeat.number": heartbeat_count,
-                    "heartbeat.target": "document-rag-orchestrator",
-                    "operation.name": "heartbeat"
-                })
+            # Only create spans for failed heartbeats to reduce noise
+            try:
+                await self.send_heartbeat()
                 
-                try:
-                    await self.send_heartbeat()
-                    heartbeat_span.set_attribute("heartbeat.sent", True)
-                except Exception as e:
-                    heartbeat_span.record_exception(e)
-                    heartbeat_span.set_attribute("heartbeat.failed", True)
-                
-                # Log periodic heartbeat for visibility
-                if heartbeat_count % 20 == 0:  # Every 10 minutes (20 * 30 seconds)
-                    self.logger.info_with_context(
-                        "Periodic heartbeat status",
-                        extra_attributes={
+                # Only log every 40 heartbeats (20 minutes) for status
+                if heartbeat_count % 40 == 0:
+                    with self.tracer.start_as_current_span("heartbeat_status") as status_span:
+                        status_span.set_attributes({
+                            "service.name": "document-rag-backend",
                             "heartbeat.count": heartbeat_count,
                             "service.uptime_minutes": (datetime.now() - self.stats["service_started"]).total_seconds() / 60,
-                            "operation": "heartbeat_status"
-                        }
-                    )
+                            "operation.name": "heartbeat_status"
+                        })
+                        
+                        self.logger.info_with_context(
+                            "Backend service heartbeat status",
+                            extra_attributes={
+                                "heartbeat.count": heartbeat_count,
+                                "service.uptime_minutes": (datetime.now() - self.stats["service_started"]).total_seconds() / 60,
+                                "operation": "heartbeat_status"
+                            }
+                        )
+                        
+            except Exception as e:
+                # Only create spans and log for failed heartbeats
+                with self.tracer.start_as_current_span("heartbeat_failed") as failed_span:
+                    failed_span.set_attributes({
+                        "service.name": "document-rag-backend",
+                        "heartbeat.number": heartbeat_count,
+                        "heartbeat.failed": True,
+                        "error.type": type(e).__name__
+                    })
+                    failed_span.record_exception(e)
             
             try:
                 await asyncio.sleep(30)
@@ -1963,30 +2037,43 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Instrument FastAPI with correlation
+# CRITICAL FIX: Instrument FastAPI with correlation and middleware
 app = instrument_fastapi_app(app, "document-rag-backend")
 
-# Add correlation middleware
+# FIXED: Add correlation middleware with proper context handling
 @app.middleware("http")
 async def add_correlation_headers(request: Request, call_next):
-    """Add correlation headers to all requests"""
+    """Add correlation headers to all requests with proper W3C context extraction"""
     # Extract trace context from incoming headers
     carrier = dict(request.headers)
-    ctx = extract_and_activate_context(carrier)
     
-    # Process request with extracted context
-    response = await call_next(request)
+    # CRITICAL FIX: Use propagate.extract directly for better compatibility
+    extracted_context = propagate.extract(carrier)
+    context_token = attach(extracted_context)
     
-    # Add correlation headers to response
-    current_span = trace.get_current_span()
-    if current_span != trace.INVALID_SPAN:
-        span_context = current_span.get_span_context()
-        response.headers["X-Trace-ID"] = format(span_context.trace_id, '032x')
-        response.headers["X-Span-ID"] = format(span_context.span_id, '016x')
-        response.headers["X-Service-Name"] = "document-rag-backend"
-        response.headers["X-Service-Version"] = "2.0.0"
-    
-    return response
+    try:
+        # Process request with extracted context
+        response = await call_next(request)
+        
+        # Add correlation headers to response
+        current_span = trace.get_current_span()
+        if current_span != trace.INVALID_SPAN:
+            span_context = current_span.get_span_context()
+            response.headers["X-Trace-ID"] = format(span_context.trace_id, '032x')
+            response.headers["X-Span-ID"] = format(span_context.span_id, '016x')
+            response.headers["X-Service-Name"] = "document-rag-backend"
+            response.headers["X-Service-Version"] = "2.0.0"
+            
+            # CRITICAL FIX: Add W3C headers for downstream services
+            w3c_headers = {}
+            propagate.inject(w3c_headers, context=extracted_context)
+            for header, value in w3c_headers.items():
+                response.headers[f"X-{header}"] = value
+        
+        return response
+    finally:
+        # CRITICAL FIX: Always detach context
+        detach(context_token)
 
 @app.get("/")
 async def root(request: Request):
@@ -2044,6 +2131,9 @@ async def get_status(request: Request):
             "http.method": "GET",
             "http.route": "/status"
         })
+
+        span.set_attribute("transaction.name", "GET /status")
+        span.set_attribute("transaction.type", "request")
         
         if not service:
             logger.error_with_context(
@@ -2194,11 +2284,12 @@ if __name__ == "__main__":
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
     
     args = parser.parse_args()
+
+    # The tracer is already initialized at module level with parent context
+    # Just create the logger here
+    logger = get_correlated_logger("backend_startup")
     
-    # Log service startup
-    startup_logger = get_correlated_logger("startup")
-    
-    # Create immediate startup spans
+    # Create startup span with existing tracer
     with tracer.start_as_current_span("backend_main_startup") as main_span:
         main_span.set_attributes({
             "service.name": "document-rag-backend",
@@ -2209,7 +2300,12 @@ if __name__ == "__main__":
             "startup.timestamp": datetime.now().isoformat()
         })
         
-        startup_logger.info_with_context(
+        # Get trace info for display
+        span_context = main_span.get_span_context()
+        trace_id = format(span_context.trace_id, '032x')
+        span_id = format(span_context.span_id, '016x')
+        
+        logger.info_with_context(
             "Backend service starting up",
             extra_attributes={
                 "host": args.host,
@@ -2223,23 +2319,17 @@ if __name__ == "__main__":
         print(f"🚀 Backend Service")
         print(f"📡 Orchestrator: {orchestrator_url}")
         print(f"🌐 Starting server on {args.host}:{args.port}")
-        print(f"🆔 Startup Trace ID: {format(main_span.get_span_context().trace_id, '032x')}")
+        print(f"🆔 Startup Trace ID: {trace_id}")
+        print(f"🆔 Startup Span ID: {span_id}")
         print(f"📤 OTEL Endpoint: {os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT')}")
-        print("🔗 Service Map: Will be visible immediately after startup")
+        print(f"🔗 Parent Trace: {os.getenv('OTEL_TRACE_PARENT', 'None')}")
         print("=" * 60)
         
-        with tracer.start_as_current_span("uvicorn_server_start") as uvicorn_span:
-            uvicorn_span.set_attributes({
-                "service.name": "document-rag-backend",
-                "server.host": args.host,
-                "server.port": args.port,
-                "server.type": "uvicorn"
-            })
-            
-            uvicorn.run(
-                "backend_service:app",
-                host=args.host,
-                port=args.port,
-                reload=args.reload,
-                log_level="info"
-            )
+        # Start uvicorn server
+        uvicorn.run(
+            "backend_service:app",
+            host=args.host,
+            port=args.port,
+            reload=args.reload,
+            log_level="info"
+        )

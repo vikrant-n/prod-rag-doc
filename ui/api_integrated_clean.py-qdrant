@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Integrated FastAPI Backend with Enhanced Retrieval and Complete OpenTelemetry Correlation
-Maintains original UI while adding middleware-based W3C trace propagation with correlated logging
+ENHANCED VERSION: Improved service map visibility and trace naming for team clarity
 """
 
 import asyncio
@@ -32,7 +32,7 @@ os.environ["OTEL_SERVICE_NAME"] = "document-rag-api"
 from otel_config import (
     initialize_opentelemetry, get_service_tracer, instrument_fastapi_app,
     inject_trace_context, extract_trace_context, get_current_trace_id,
-    TracedHTTPXClient, get_correlated_logger, get_code_context, enhanced_error_logging  # NEW: Import correlated logger
+    TracedHTTPXClient, get_correlated_logger, get_code_context, enhanced_error_logging
 )
 
 # Replace existing logger with correlated logger
@@ -41,17 +41,18 @@ logger = get_correlated_logger(__name__)
 # Initialize OpenTelemetry with proper hierarchy
 tracer, meter = initialize_opentelemetry(
     service_name="document-rag-api",
-    service_version="1.0.0",
+    service_version="2.1.0",  # Updated version for enhanced visibility
     environment=os.getenv("OTEL_ENVIRONMENT", "production")
 )
 
-# Metrics - preserved from original
-query_counter = meter.create_counter("queries_total", description="Total number of queries processed")
-query_duration = meter.create_histogram("query_duration_seconds", description="Query processing duration")
-response_quality = meter.create_histogram("response_confidence", description="Response confidence scores")
-api_errors = meter.create_counter("api_errors_total", description="Total number of API errors")
-api_requests = meter.create_counter("api_requests_total", description="Total number of API requests")
-external_api_calls = meter.create_counter("external_api_calls_total", description="Total number of external API calls")
+# ENHANCED METRICS: More descriptive names and business context
+user_query_counter = meter.create_counter("user_queries_processed", description="Total user queries processed by type")
+business_query_duration = meter.create_histogram("business_query_duration_seconds", description="End-to-end user query processing time")
+document_retrieval_counter = meter.create_counter("documents_retrieved_total", description="Documents retrieved from vector store")
+ai_response_quality = meter.create_histogram("ai_response_confidence_score", description="AI response confidence scores")
+user_experience_errors = meter.create_counter("user_experience_errors", description="User-facing errors by category")
+backend_service_calls = meter.create_counter("backend_service_calls", description="Calls to document processing backend")
+vector_db_operations = meter.create_counter("vector_database_operations", description="Vector database operations by type")
 
 # Import enhanced pipeline components - preserved from original
 try:
@@ -135,11 +136,11 @@ class SessionInfo(BaseModel):
     last_activity: Optional[str]
     metadata: Dict[str, Any]
 
-# FastAPI application - same as original
+# FastAPI application with enhanced metadata
 app = FastAPI(
-    title="Enhanced Document RAG Query Interface",
-    description="Advanced web-based interface with enhanced retrieval and complete service correlation",
-    version="2.0.0",
+    title="📚 Document RAG API - Intelligent Query Processing",
+    description="Advanced document retrieval and AI response system with comprehensive observability",
+    version="2.1.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -172,11 +173,11 @@ conversation_contexts: Dict[str, Any] = {}
 sessions: Dict[str, SessionInfo] = {}
 
 class EnhancedQueryEngine:
-    """Enhanced query engine with complete service correlation and trace propagation."""
+    """Enhanced query engine with business-focused tracing and clear service mapping."""
     
     def __init__(self):
-        self.tracer = get_service_tracer("query-processor")
-        self.logger = get_correlated_logger(f"{__name__}.EnhancedQueryEngine")  # NEW: Add correlated logger
+        self.tracer = get_service_tracer("intelligent-query-processor")  # ENHANCED: More descriptive name
+        self.logger = get_correlated_logger(f"{__name__}.IntelligentQueryEngine")  # ENHANCED: Better component name
         self.qdrant_host = os.getenv("QDRANT_HOST", "localhost")
         self.qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
         self.collection_name = os.getenv("COLLECTION_NAME", "documents")
@@ -191,35 +192,41 @@ class EnhancedQueryEngine:
         self._initialize_components()
     
     def _initialize_components(self):
-        """Initialize enhanced components with tracing"""
-        with self.tracer.start_as_current_span("api_initialize_components") as span:
+        """Initialize enhanced components with business-focused tracing"""
+        with self.tracer.start_as_current_span("📚 Initialize_Document_Retrieval_System") as span:  # ENHANCED: Clear business name
             span.set_attributes({
                 "service.name": "document-rag-api",
-                "service.component": "query-processor",
-                "operation.name": "initialize_components"
+                "service.component": "intelligent-query-processor",
+                "business.operation": "system_initialization",
+                "system.phase": "component_setup",
+                "operation.description": "Setting up document retrieval and AI response components"
             })
             
             self.logger.info_with_context(
-                "Initializing enhanced query engine components",
+                "🚀 Initializing intelligent document retrieval system",
                 extra_attributes={
                     "qdrant.host": self.qdrant_host,
                     "qdrant.port": self.qdrant_port,
                     "collection.name": self.collection_name,
                     "embedding.model": self.embedding_model,
+                    "business.operation": "system_initialization",
                     "operation": "component_initialization"
                 }
             )
             
             try:
-                # Initialize basic vector store
+                # Initialize basic vector store with enhanced naming
                 embeddings = OpenAIEmbeddings(model=self.embedding_model)
                 
-                with self.tracer.start_as_current_span("connect_qdrant") as qdrant_span:
+                with self.tracer.start_as_current_span("🔌 Connect_to_Vector_Database") as qdrant_span:  # ENHANCED: Clear purpose
                     qdrant_span.set_attributes({
                         "service.name": "document-rag-api",
-                        "external.service.name": "qdrant",
-                        "external.service.type": "vector_db",
-                        "db.system": "qdrant"
+                        "external.service.name": "qdrant-vector-database",
+                        "external.service.type": "vector_database",
+                        "db.system": "qdrant",
+                        "db.name": self.collection_name,
+                        "business.operation": "database_connection",
+                        "operation.description": "Connecting to document vector store for similarity search"
                     })
                     
                     self.vector_store = QdrantVectorStore.from_existing_collection(
@@ -227,62 +234,114 @@ class EnhancedQueryEngine:
                         embedding=embeddings,
                         url=f"http://{self.qdrant_host}:{self.qdrant_port}",
                     )
+                    
+                    # ENHANCED: Add database health check span
+                    with self.tracer.start_as_current_span("🏥 Vector_Database_Health_Check") as health_span:
+                        health_span.set_attributes({
+                            "service.name": "document-rag-api",
+                            "external.service.name": "qdrant-vector-database",
+                            "health.check_type": "connection_validation",
+                            "business.operation": "database_health_validation"
+                        })
+                        
+                        # Test the connection
+                        try:
+                            test_docs = self.vector_store.similarity_search("test", k=1)
+                            health_span.set_attribute("health.status", "healthy")
+                            health_span.set_attribute("test.documents_available", len(test_docs) > 0)
+                        except Exception as health_error:
+                            health_span.record_exception(health_error)
+                            health_span.set_attribute("health.status", "unhealthy")
                 
                 self.logger.info_with_context(
-                    "Successfully connected to Qdrant vector store",
+                    "✅ Successfully connected to vector database",
                     extra_attributes={
                         "qdrant.host": self.qdrant_host,
                         "qdrant.port": self.qdrant_port,
                         "collection.name": self.collection_name,
+                        "business.operation": "database_connection",
                         "operation": "qdrant_connection",
                         "status": "success"
                     }
                 )
                 
-                # Initialize enhanced components if available
+                # ENHANCED: Initialize components with descriptive span names
                 components_initialized = 0
                 
                 if BM25IndexManager:
-                    self.hybrid_search = BM25IndexManager()
-                    components_initialized += 1
-                    self.logger.info_with_context(
-                        "Initialized BM25 hybrid search",
-                        extra_attributes={"component": "bm25_search", "status": "initialized"}
-                    )
+                    with self.tracer.start_as_current_span("🔍 Initialize_Hybrid_Search_Engine") as bm25_span:
+                        bm25_span.set_attributes({
+                            "service.component": "hybrid-search-engine",
+                            "business.operation": "search_capability_setup",
+                            "operation.description": "Setting up BM25 + vector hybrid search"
+                        })
+                        self.hybrid_search = BM25IndexManager()
+                        components_initialized += 1
+                        self.logger.info_with_context(
+                            "🔍 Hybrid search engine initialized",
+                            extra_attributes={"component": "hybrid_search_engine", "status": "initialized"}
+                        )
                 
                 if ContextAwareQueryEngine:
-                    self.context_aware_engine = ContextAwareQueryEngine(
-                        vector_store=self.vector_store,
-                        embeddings=embeddings
-                    )
-                    components_initialized += 1
-                    self.logger.info_with_context(
-                        "Initialized context-aware query engine",
-                        extra_attributes={"component": "context_aware_engine", "status": "initialized"}
-                    )
+                    with self.tracer.start_as_current_span("🧠 Initialize_Context_Aware_AI") as context_span:
+                        context_span.set_attributes({
+                            "service.component": "context-aware-ai",
+                            "business.operation": "ai_context_setup",
+                            "operation.description": "Setting up conversation-aware query processing"
+                        })
+                        self.context_aware_engine = ContextAwareQueryEngine(
+                            vector_store=self.vector_store,
+                            embeddings=embeddings
+                        )
+                        components_initialized += 1
+                        self.logger.info_with_context(
+                            "🧠 Context-aware AI engine initialized",
+                            extra_attributes={"component": "context_aware_ai", "status": "initialized"}
+                        )
                 
                 if ResponseGenerator:
-                    self.response_generator = ResponseGenerator()
-                    components_initialized += 1
-                    self.logger.info_with_context(
-                        "Initialized enhanced response generator",
-                        extra_attributes={"component": "response_generator", "status": "initialized"}
-                    )
+                    with self.tracer.start_as_current_span("✍️ Initialize_AI_Response_Generator") as response_span:
+                        response_span.set_attributes({
+                            "service.component": "ai-response-generator",
+                            "business.operation": "response_generation_setup",
+                            "operation.description": "Setting up AI-powered response generation"
+                        })
+                        self.response_generator = ResponseGenerator()
+                        components_initialized += 1
+                        self.logger.info_with_context(
+                            "✍️ AI response generator initialized",
+                            extra_attributes={"component": "ai_response_generator", "status": "initialized"}
+                        )
                 
                 if SourceAttributionProcessor:
-                    self.source_attributor = SourceAttributionProcessor()
-                    components_initialized += 1
-                    self.logger.info_with_context(
-                        "Initialized source attribution processor",
-                        extra_attributes={"component": "source_attributor", "status": "initialized"}
-                    )
+                    with self.tracer.start_as_current_span("📖 Initialize_Citation_System") as citation_span:
+                        citation_span.set_attributes({
+                            "service.component": "citation-system",
+                            "business.operation": "citation_setup",
+                            "operation.description": "Setting up source attribution and citation formatting"
+                        })
+                        self.source_attributor = SourceAttributionProcessor()
+                        components_initialized += 1
+                        self.logger.info_with_context(
+                            "📖 Citation system initialized",
+                            extra_attributes={"component": "citation_system", "status": "initialized"}
+                        )
+                
+                span.set_attributes({
+                    "system.initialization_complete": True,
+                    "components.total_count": 4,
+                    "components.initialized_count": components_initialized,
+                    "system.capability_level": "enhanced" if components_initialized > 2 else "basic"
+                })
                 
                 self.logger.info_with_context(
-                    "Component initialization completed",
+                    f"🎯 System initialization completed - {components_initialized}/4 components active",
                     extra_attributes={
                         "components.total": 4,
                         "components.initialized": components_initialized,
                         "components.basic_mode": components_initialized == 0,
+                        "system.capability_level": "enhanced" if components_initialized > 2 else "basic",
+                        "business.operation": "system_initialization",
                         "operation": "component_initialization",
                         "status": "completed"
                     }
@@ -290,11 +349,16 @@ class EnhancedQueryEngine:
                 
             except Exception as e:
                 span.record_exception(e)
+                span.set_attributes({
+                    "system.initialization_failed": True,
+                    "error.category": "system_startup_failure"
+                })
                 self.logger.error_with_context(
-                    "Error initializing enhanced query engine",
+                    "💥 System initialization failed",
                     extra_attributes={
                         "error.type": type(e).__name__,
                         "error.message": str(e),
+                        "business.operation": "system_initialization",
                         "operation": "component_initialization",
                         "status": "failed"
                     },
@@ -303,122 +367,165 @@ class EnhancedQueryEngine:
                 self.vector_store = None
     
     async def process_query(self, request: QueryRequest) -> QueryResponse:
-        """Process a query with comprehensive logging"""
-        with self.tracer.start_as_current_span("api_process_query") as span:
+        """Process user query with comprehensive business-focused logging"""
+        with self.tracer.start_as_current_span("🎯 User_Question_Processing") as span:  # ENHANCED: Clear business operation
             correlation_id = get_current_trace_id()[:16]
+            query_hash = hashlib.md5(request.query.encode()).hexdigest()[:8]
             
-            # Log query start with context
+            # ENHANCED: Business-focused attributes
+            span.set_attributes({
+                "service.name": "document-rag-api",
+                "service.component": "intelligent-query-processor",
+                "business.operation": "answer_user_question",
+                "user.session_type": "returning_user" if request.session_id else "new_user",
+                "user.session_id": request.session_id or "anonymous",
+                "query.business_hash": query_hash,
+                "query.character_length": len(request.query),
+                "query.word_count": len(request.query.split()),
+                "query.citation_format_requested": request.citation_format,
+                "query.max_sources_requested": request.max_sources or 5,
+                "w3c.correlation_id": correlation_id,
+                "operation.description": "Processing user question to find relevant documents and generate AI response"
+            })
+            
+            # Log query start with business context
             self.logger.info_with_context(
-                "Processing user query",
+                f"🔍 Processing user question: '{request.query[:50]}{'...' if len(request.query) > 50 else ''}'",
                 extra_attributes={
                     "query.length": len(request.query),
-                    "query.hash": hashlib.md5(request.query.encode()).hexdigest()[:8],
+                    "query.business_hash": query_hash,
                     "user.session_id": request.session_id or "anonymous",
+                    "user.session_type": "returning" if request.session_id else "new",
                     "query.citation_format": request.citation_format,
+                    "business.operation": "user_question_processing",
                     "correlation.id": correlation_id,
                     "operation": "query_processing"
                 }
             )
-            
-            # Set comprehensive correlation attributes
-            span.set_attributes({
-                "service.name": "document-rag-api",
-                "service.component": "query-processor",
-                "user.session_id": request.session_id or "anonymous",
-                "query.length": len(request.query),
-                "query.citation_format": request.citation_format,
-                "query.hash": hashlib.md5(request.query.encode()).hexdigest()[:8],
-                "w3c.trace_id": get_current_trace_id()
-            })
             
             start_time = datetime.now()
             
             try:
                 if not self.vector_store:
                     self.logger.error_with_context(
-                        "Vector store not available",
+                        "🚫 Vector database not available - cannot process user questions",
                         extra_attributes={
-                            "service.component": "vector_store",
+                            "service.component": "vector_database",
                             "availability": "unavailable",
-                            "operation": "query_processing"
+                            "business.impact": "user_queries_blocked",
+                            "business.operation": "user_question_processing"
                         }
                     )
-                    raise HTTPException(status_code=503, detail="Vector store not available")
+                    raise HTTPException(status_code=503, detail="Document search system unavailable")
                 
-                # Get or create conversation context
+                # ENHANCED: Session management with clear business purpose
                 session_id = request.session_id or str(uuid.uuid4())
                 conversation_context = conversation_contexts.get(session_id)
                 
                 if ConversationContext and not conversation_context:
-                    conversation_context = ConversationContext(session_id=session_id)
-                    conversation_contexts[session_id] = conversation_context
-                    
-                    self.logger.debug_with_context(
-                        "Created new conversation context",
-                        extra_attributes={
-                            "session.id": session_id,
-                            "operation": "session_management"
-                        }
-                    )
+                    with self.tracer.start_as_current_span("👤 Create_User_Conversation_Context") as session_span:
+                        session_span.set_attributes({
+                            "service.component": "session-manager",
+                            "business.operation": "user_session_creation",
+                            "user.session_id": session_id,
+                            "user.session_type": "new",
+                            "operation.description": "Creating conversation memory for multi-turn dialogue"
+                        })
+                        
+                        conversation_context = ConversationContext(session_id=session_id)
+                        conversation_contexts[session_id] = conversation_context
+                        
+                        self.logger.info_with_context(
+                            f"👤 Created conversation context for user session {session_id[:8]}",
+                            extra_attributes={
+                                "session.id": session_id,
+                                "business.operation": "user_session_creation",
+                                "operation": "session_management"
+                            }
+                        )
                 
-                # Log backend service call
-                with self.tracer.start_as_current_span("call_backend_service") as backend_span:
+                # ENHANCED: Backend health check with clear business purpose
+                with self.tracer.start_as_current_span("🔗 Check_Document_Processing_Backend") as backend_span:
                     backend_span.set_attributes({
                         "service.name": "document-rag-api",
                         "peer.service": "document-rag-backend",
-                        "internal.service.call": True,
-                        "correlation.id": correlation_id
+                        "service.dependency": "document_processing_backend",
+                        "business.operation": "backend_health_validation",
+                        "health.check_purpose": "ensure_document_processing_available",
+                        "correlation.id": correlation_id,
+                        "operation.description": "Verifying document processing backend is available for user queries"
                     })
                     
                     try:
                         # Use TracedHTTPXClient for proper context propagation
-                        async with TracedHTTPXClient(service_name="backend-proxy") as client:
+                        async with TracedHTTPXClient(service_name="backend-health-checker") as client:
                             response = await client.get(
                                 "http://localhost:8001/status",
                                 timeout=5.0
                             )
-                            backend_span.set_attribute("backend.status", response.status_code)
+                            backend_span.set_attributes({
+                                "backend.availability": "available" if response.status_code == 200 else "degraded",
+                                "backend.http_status": response.status_code,
+                                "health.validation_result": "passed" if response.status_code == 200 else "failed"
+                            })
                             
-                            self.logger.debug_with_context(
-                                "Backend service health check",
+                            self.logger.info_with_context(
+                                f"✅ Document processing backend is {'healthy' if response.status_code == 200 else 'degraded'}",
                                 extra_attributes={
                                     "backend.status_code": response.status_code,
                                     "backend.service": "document-rag-backend",
-                                    "health_check": "success",
+                                    "backend.availability": "healthy" if response.status_code == 200 else "degraded",
+                                    "business.operation": "backend_health_validation",
                                     "operation": "backend_health_check"
                                 }
                             )
                             
                     except Exception as e:
                         backend_span.record_exception(e)
+                        backend_span.set_attributes({
+                            "backend.availability": "unavailable",
+                            "health.validation_result": "failed",
+                            "error.category": "backend_unavailable"
+                        })
                         self.logger.warning_with_context(
-                            "Backend service unreachable",
+                            "⚠️ Document processing backend unreachable (continuing with cached documents)",
                             extra_attributes={
                                 "backend.service": "document-rag-backend",
-                                "health_check": "failed",
+                                "backend.availability": "unavailable",
+                                "business.impact": "reduced_functionality",
                                 "error.type": type(e).__name__,
                                 "error.message": str(e),
+                                "business.operation": "backend_health_validation",
                                 "operation": "backend_health_check"
                             }
                         )
                 
-                # Process query and log results
+                # ENHANCED: Choose processing method with clear business logic
                 if self.context_aware_engine and conversation_context:
+                    # Add user message to conversation context
                     if hasattr(conversation_context, 'add_message'):
-                        conversation_context.add_message(
-                            message_type=MessageType.USER,
-                            content=request.query,
-                            metadata={
-                                "timestamp": datetime.now().isoformat(),
-                                "correlation_id": correlation_id
-                            }
-                        )
+                        with self.tracer.start_as_current_span("💭 Add_User_Message_to_Context") as context_span:
+                            context_span.set_attributes({
+                                "service.component": "conversation-context-manager",
+                                "business.operation": "conversation_memory_update",
+                                "message.type": "user_question",
+                                "operation.description": "Adding user question to conversation history for context-aware responses"
+                            })
+                            
+                            conversation_context.add_message(
+                                message_type=MessageType.USER,
+                                content=request.query,
+                                metadata={
+                                    "timestamp": datetime.now().isoformat(),
+                                    "correlation_id": correlation_id
+                                }
+                            )
                     
-                    result = await self._process_with_enhanced_engine(request, conversation_context, correlation_id)
-                    processing_method = "enhanced"
+                    result = await self._process_with_enhanced_intelligence(request, conversation_context, correlation_id)
+                    processing_method = "enhanced_ai_processing"
                 else:
-                    result = await self._process_with_basic_engine(request, correlation_id)
-                    processing_method = "basic"
+                    result = await self._process_with_basic_retrieval(request, correlation_id)
+                    processing_method = "basic_document_search"
                 
                 processing_time = (datetime.now() - start_time).total_seconds()
                 
@@ -429,47 +536,73 @@ class EnhancedQueryEngine:
                 result.metadata.update({
                     "correlation_id": correlation_id,
                     "service_name": "document-rag-api",
-                    "trace_id": get_current_trace_id()
+                    "trace_id": get_current_trace_id(),
+                    "processing_method": processing_method
                 })
                 
-                # Add assistant response to context
+                # ENHANCED: Add AI response to conversation context
                 if conversation_context and hasattr(conversation_context, 'add_message'):
-                    conversation_context.add_message(
-                        message_type=MessageType.ASSISTANT,
-                        content=result.response,
-                        metadata={
-                            "sources": result.sources,
-                            "confidence": result.confidence,
-                            "timestamp": datetime.now().isoformat(),
-                            "correlation_id": correlation_id
-                        }
-                    )
+                    with self.tracer.start_as_current_span("💾 Save_AI_Response_to_Context") as save_span:
+                        save_span.set_attributes({
+                            "service.component": "conversation-context-manager",
+                            "business.operation": "conversation_memory_update",
+                            "message.type": "ai_response",
+                            "response.confidence": result.confidence,
+                            "response.sources_count": len(result.sources),
+                            "operation.description": "Saving AI response to conversation history"
+                        })
+                        
+                        conversation_context.add_message(
+                            message_type=MessageType.ASSISTANT,
+                            content=result.response,
+                            metadata={
+                                "sources": result.sources,
+                                "confidence": result.confidence,
+                                "timestamp": datetime.now().isoformat(),
+                                "correlation_id": correlation_id
+                            }
+                        )
                 
-                # Log successful completion
+                # ENHANCED: Comprehensive success logging with business metrics
+                span.set_attributes({
+                    "business.query_completed": True,
+                    "processing.duration_seconds": processing_time,
+                    "processing.method_used": processing_method,
+                    "response.confidence_score": result.confidence,
+                    "response.sources_found": len(result.sources),
+                    "response.word_count": len(result.response.split()),
+                    "user.experience_quality": "high" if result.confidence > 0.7 else "medium",
+                    "correlation.id": correlation_id
+                })
+                
                 self.logger.info_with_context(
-                    "Query processing completed",
+                    f"🎉 User question answered successfully in {processing_time:.2f}s (confidence: {result.confidence:.2f})",
                     extra_attributes={
                         "processing.time_seconds": processing_time,
                         "processing.method": processing_method,
                         "response.confidence": result.confidence,
                         "response.sources_count": len(result.sources),
                         "response.word_count": len(result.response.split()),
+                        "user.experience_quality": "high" if result.confidence > 0.7 else "medium",
+                        "business.operation": "user_question_processing",
                         "correlation.id": correlation_id,
                         "operation": "query_processing",
                         "status": "success"
                     }
                 )
                 
-                # Record metrics
-                query_counter.add(1, {"session_type": "authenticated" if request.session_id else "anonymous"})
-                query_duration.record(processing_time)
-                response_quality.record(result.confidence)
-                
-                span.set_attributes({
-                    "processing_time": processing_time,
-                    "response_confidence": result.confidence,
-                    "sources_count": len(result.sources),
-                    "correlation.id": correlation_id
+                # ENHANCED: Record business metrics
+                user_query_counter.add(1, {
+                    "session_type": "returning" if request.session_id else "new",
+                    "processing_method": processing_method,
+                    "confidence_level": "high" if result.confidence > 0.7 else "medium"
+                })
+                business_query_duration.record(processing_time, {
+                    "processing_method": processing_method
+                })
+                ai_response_quality.record(result.confidence)
+                document_retrieval_counter.add(len(result.sources), {
+                    "retrieval_method": processing_method
                 })
                 
                 return result
@@ -477,96 +610,164 @@ class EnhancedQueryEngine:
             except Exception as e:
                 processing_time = (datetime.now() - start_time).total_seconds()
                 
-                # Log error with full context
+                # ENHANCED: Comprehensive error logging with business impact
+                span.record_exception(e)
+                span.set_attributes({
+                    "business.query_failed": True,
+                    "error.category": "user_query_processing_failure",
+                    "business.impact": "user_cannot_get_answer",
+                    "processing.duration_before_failure": processing_time
+                })
+                
                 self.logger.error_with_context(
-                    "Query processing failed",
+                    f"💥 User question processing failed after {processing_time:.2f}s",
                     extra_attributes={
                         "processing.time_seconds": processing_time,
                         "error.type": type(e).__name__,
                         "error.message": str(e),
+                        "business.impact": "user_query_blocked",
+                        "user.session_id": request.session_id or "anonymous",
                         "correlation.id": correlation_id,
+                        "business.operation": "user_question_processing",
                         "operation": "query_processing",
                         "status": "failed"
                     },
                     exc_info=True
                 )
                 
-                span.record_exception(e)
-                api_errors.add(1, {"operation": "query_processing"})
-                raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
+                user_experience_errors.add(1, {
+                    "operation": "query_processing",
+                    "error_type": type(e).__name__
+                })
+                raise HTTPException(status_code=500, detail=f"Unable to process your question: {str(e)}")
     
-    async def _process_with_enhanced_engine(self, request: QueryRequest, context, correlation_id: str) -> QueryResponse:
-        """Process query with enhanced components and correlation"""
-        with self.tracer.start_as_current_span("enhanced_query_processing") as span:
+    async def _process_with_enhanced_intelligence(self, request: QueryRequest, context, correlation_id: str) -> QueryResponse:
+        """Process query with enhanced AI and context awareness"""
+        with self.tracer.start_as_current_span("🧠 Enhanced_AI_Question_Processing") as span:  # ENHANCED: Clear AI operation
             span.set_attributes({
-                "service.component": "enhanced-retrieval",
-                "correlation.id": correlation_id
+                "service.component": "enhanced-ai-processor",
+                "business.operation": "intelligent_document_retrieval",
+                "ai.processing_type": "context_aware",
+                "correlation.id": correlation_id,
+                "operation.description": "Using context-aware AI to find and synthesize relevant documents"
             })
             
             self.logger.info_with_context(
-                "Processing with enhanced engine",
+                "🧠 Using enhanced AI processing with conversation context",
                 extra_attributes={
-                    "processing.type": "enhanced",
+                    "processing.type": "enhanced_ai",
+                    "ai.context_aware": True,
                     "correlation.id": correlation_id,
+                    "business.operation": "intelligent_processing",
                     "operation": "enhanced_processing"
                 }
             )
             
             try:
-                # Use context-aware query processing
-                query_result = await self.context_aware_engine.process_query(
-                    query=request.query,
-                    conversation_context=context,
-                    max_sources=request.max_sources
-                )
-                
-                # Generate enhanced response
-                if self.response_generator:
-                    response_text = await self.response_generator.generate_response(
+                # ENHANCED: Context-aware query processing with clear spans
+                with self.tracer.start_as_current_span("🔍 AI_Document_Search_and_Ranking") as search_span:
+                    search_span.set_attributes({
+                        "service.component": "ai-document-searcher",
+                        "business.operation": "find_relevant_documents",
+                        "operation.description": "Using AI to search and rank documents by relevance"
+                    })
+                    
+                    query_result = await self.context_aware_engine.process_query(
                         query=request.query,
-                        retrieved_docs=query_result.get('documents', []),
-                        context=context,
-                        style=request.response_style
+                        conversation_context=context,
+                        max_sources=request.max_sources
                     )
-                else:
-                    response_text = await self._generate_basic_response(
-                        request.query, query_result.get('documents', []), correlation_id
-                    )
+                    
+                    search_span.set_attributes({
+                        "documents.found_count": len(query_result.get('documents', [])),
+                        "search.confidence_score": query_result.get('confidence', 0.0),
+                        "ai.search_successful": True
+                    })
                 
-                # Enhanced source attribution
+                # ENHANCED: AI response generation with clear business purpose
+                with self.tracer.start_as_current_span("✍️ Generate_AI_Response_from_Documents") as response_span:
+                    response_span.set_attributes({
+                        "service.component": "ai-response-generator",
+                        "business.operation": "synthesize_answer_from_documents",
+                        "ai.model_type": "enhanced_context_aware",
+                        "operation.description": "Generating comprehensive answer using retrieved documents and conversation context"
+                    })
+                    
+                    if self.response_generator:
+                        response_text = await self.response_generator.generate_response(
+                            query=request.query,
+                            retrieved_docs=query_result.get('documents', []),
+                            context=context,
+                            style=request.response_style
+                        )
+                    else:
+                        response_text = await self._generate_basic_response(
+                            request.query, query_result.get('documents', []), correlation_id
+                        )
+                    
+                    response_span.set_attributes({
+                        "response.generated_word_count": len(response_text.split()),
+                        "response.character_length": len(response_text),
+                        "ai.generation_successful": True
+                    })
+                
+                # ENHANCED: Source attribution and citation with clear purpose
                 sources = []
-                if self.source_attributor and query_result.get('documents'):
-                    sources = self.source_attributor.process_sources(
-                        documents=query_result['documents'],
-                        query=request.query,
-                        citation_format=CitationFormat(request.citation_format)
-                    )
-                else:
-                    # Fallback source processing
-                    for i, doc in enumerate(query_result.get('documents', [])):
-                        source = {
-                            "id": f"doc_{i}",
-                            "title": doc.metadata.get("title", f"Document {i+1}"),
-                            "content": doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content,
-                            "confidence": query_result.get('scores', [0.8])[i] if i < len(query_result.get('scores', [])) else 0.8,
-                            "metadata": doc.metadata,
-                            "page_number": doc.metadata.get("page", None),
-                            "source_url": doc.metadata.get("source", None),
-                            "google_drive_url": doc.metadata.get("google_drive_url", None),
-                            "correlation_id": correlation_id
-                        }
-                        sources.append(source)
+                with self.tracer.start_as_current_span("📚 Create_Source_Citations") as citation_span:
+                    citation_span.set_attributes({
+                        "service.component": "citation-formatter",
+                        "business.operation": "format_document_sources",
+                        "citation.format_requested": request.citation_format,
+                        "operation.description": "Creating properly formatted citations for retrieved documents"
+                    })
+                    
+                    if self.source_attributor and query_result.get('documents'):
+                        sources = self.source_attributor.process_sources(
+                            documents=query_result['documents'],
+                            query=request.query,
+                            citation_format=CitationFormat(request.citation_format)
+                        )
+                    else:
+                        # Fallback source processing with enhanced metadata
+                        for i, doc in enumerate(query_result.get('documents', [])):
+                            source = {
+                                "id": f"doc_{i}",
+                                "title": doc.metadata.get("title", f"Document {i+1}"),
+                                "content": doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content,
+                                "confidence": query_result.get('scores', [0.8])[i] if i < len(query_result.get('scores', [])) else 0.8,
+                                "metadata": doc.metadata,
+                                "page_number": doc.metadata.get("page", None),
+                                "source_url": doc.metadata.get("source", None),
+                                "google_drive_url": doc.metadata.get("google_drive_url", None),
+                                "correlation_id": correlation_id,
+                                "relevance_rank": i + 1
+                            }
+                            sources.append(source)
+                    
+                    citation_span.set_attributes({
+                        "citations.created_count": len(sources),
+                        "citation.format_used": request.citation_format
+                    })
                 
                 # Create citations
                 citations = self._create_citations(query_result.get('documents', []), request.citation_format)
                 
+                span.set_attributes({
+                    "business.processing_successful": True,
+                    "documents.retrieved_count": len(query_result.get('documents', [])),
+                    "sources.formatted_count": len(sources),
+                    "citations.created_count": len(citations)
+                })
+                
                 self.logger.info_with_context(
-                    "Enhanced processing completed successfully",
+                    f"Enhanced AI processing completed - found {len(sources)} relevant documents",
                     extra_attributes={
                         "documents.count": len(query_result.get('documents', [])),
                         "sources.count": len(sources),
                         "citations.count": len(citations),
+                        "ai.confidence": query_result.get('confidence', 0.0),
                         "correlation.id": correlation_id,
+                        "business.operation": "enhanced_processing",
                         "operation": "enhanced_processing",
                         "status": "success"
                     }
@@ -577,7 +778,7 @@ class EnhancedQueryEngine:
                     response=response_text,
                     sources=sources,
                     confidence=query_result.get('confidence', 0.8),
-                    query_type=query_result.get('query_type', 'enhanced_retrieval'),
+                    query_type="enhanced_ai_retrieval",
                     complexity=query_result.get('complexity', 'medium'),
                     processing_time=0.0,  # Will be updated by caller
                     context_used=request.include_context,
@@ -587,6 +788,7 @@ class EnhancedQueryEngine:
                     metadata={
                         "sources_count": len(sources),
                         "enhanced_processing": True,
+                        "ai_processing_method": "context_aware",
                         "correlation_id": correlation_id
                     },
                     timestamp=""  # Will be updated by caller
@@ -594,92 +796,144 @@ class EnhancedQueryEngine:
                 
             except Exception as e:
                 span.record_exception(e)
+                span.set_attributes({
+                    "business.enhanced_processing_failed": True,
+                    "fallback.triggered": True,
+                    "error.category": "ai_processing_failure"
+                })
                 self.logger.error_with_context(
-                    "Enhanced processing failed, falling back to basic",
+                    "Enhanced AI processing failed, falling back to basic document search",
                     extra_attributes={
                         "error.type": type(e).__name__,
                         "error.message": str(e),
+                        "fallback.method": "basic_document_search",
+                        "business.impact": "reduced_answer_quality",
                         "correlation.id": correlation_id,
+                        "business.operation": "enhanced_processing",
                         "operation": "enhanced_processing",
                         "status": "failed_fallback"
                     },
                     exc_info=True
                 )
-                return await self._process_with_basic_engine(request, correlation_id)
+                return await self._process_with_basic_retrieval(request, correlation_id)
     
-    async def _process_with_basic_engine(self, request: QueryRequest, correlation_id: str) -> QueryResponse:
-        """Fallback to basic query processing with correlation"""
-        with self.tracer.start_as_current_span("basic_query_processing") as span:
+    async def _process_with_basic_retrieval(self, request: QueryRequest, correlation_id: str) -> QueryResponse:
+        """Fallback to basic document search and retrieval with clear business context"""
+        with self.tracer.start_as_current_span("📄 Basic_Document_Search_and_Retrieval") as span:  # ENHANCED: Clear fallback operation
             span.set_attributes({
-                "service.component": "basic-retrieval",
-                "correlation.id": correlation_id
+                "service.component": "basic-document-retriever",
+                "business.operation": "simple_document_search",
+                "processing.method": "basic_vector_similarity",
+                "correlation.id": correlation_id,
+                "operation.description": "Searching documents using vector similarity without context awareness"
             })
             
             self.logger.info_with_context(
-                "Processing with basic engine",
+                "Using basic document search (no conversation context)",
                 extra_attributes={
-                    "processing.type": "basic",
+                    "processing.type": "basic_document_search",
+                    "ai.context_aware": False,
                     "correlation.id": correlation_id,
+                    "business.operation": "basic_processing",
                     "operation": "basic_processing"
                 }
             )
             
-            # Perform similarity search with vector database
-            with self.tracer.start_as_current_span("qdrant_similarity_search") as search_span:
+            # ENHANCED: Vector similarity search with detailed business context
+            with self.tracer.start_as_current_span("🔍 Vector_Database_Document_Search") as search_span:
                 search_span.set_attributes({
-                    "external.service.name": "qdrant",
-                    "external.service.type": "vector_db",
+                    "external.service.name": "qdrant-vector-database",
+                    "external.service.type": "vector_database",
                     "db.system": "qdrant",
                     "db.operation": "similarity_search",
-                    "correlation.id": correlation_id
+                    "db.collection": self.collection_name,
+                    "search.max_results": request.max_sources or 5,
+                    "business.operation": "document_similarity_search",
+                    "correlation.id": correlation_id,
+                    "operation.description": "Searching vector database for documents similar to user query"
                 })
+                
+                self.logger.info_with_context(
+                    f"Searching vector database for documents similar to user query",
+                    extra_attributes={
+                        "search.k": request.max_sources or 5,
+                        "search.collection": self.collection_name,
+                        "operation": "vector_similarity_search"
+                    }
+                )
                 
                 docs = self.vector_store.similarity_search(
                     request.query, k=request.max_sources or 5
                 )
-                search_span.set_attribute("documents_found", len(docs))
                 
-                self.logger.debug_with_context(
-                    "Qdrant similarity search completed",
+                search_span.set_attributes({
+                    "search.documents_found": len(docs),
+                    "search.results_available": len(docs) > 0,
+                    "search.successful": True
+                })
+                
+                self.logger.info_with_context(
+                    f"Found {len(docs)} relevant documents in vector database",
                     extra_attributes={
                         "documents.found": len(docs),
                         "search.k": request.max_sources or 5,
+                        "search.successful": True,
                         "operation": "similarity_search"
                     }
                 )
             
-            # Track external API call
-            external_api_calls.add(1, {"service": "qdrant", "operation": "similarity_search"})
+            # Track external API call with business context
+            vector_db_operations.add(1, {"operation": "similarity_search", "collection": self.collection_name})
             
-            # Create sources from documents
+            # ENHANCED: Create sources with detailed metadata
             sources = []
-            for i, doc in enumerate(docs):
-                source = {
-                    "id": f"doc_{i}",
-                    "title": doc.metadata.get("title", f"Document {i+1}"),
-                    "content": doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content,
-                    "confidence": 0.8,  # Placeholder confidence
-                    "metadata": doc.metadata,
-                    "page_number": doc.metadata.get("page", None),
-                    "source_url": doc.metadata.get("source", None),
-                    "google_drive_url": doc.metadata.get("google_drive_url", None),
-                    "correlation_id": correlation_id
-                }
-                sources.append(source)
+            with self.tracer.start_as_current_span("📋 Format_Document_Sources_for_User") as format_span:
+                format_span.set_attributes({
+                    "service.component": "source-formatter",
+                    "business.operation": "prepare_sources_for_user_display",
+                    "operation.description": "Formatting retrieved documents for user-friendly display"
+                })
+                
+                for i, doc in enumerate(docs):
+                    source = {
+                        "id": f"doc_{i}",
+                        "title": doc.metadata.get("title", f"Document {i+1}"),
+                        "content": doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content,
+                        "confidence": 0.8,  # Placeholder confidence
+                        "relevance_rank": i + 1,
+                        "metadata": doc.metadata,
+                        "page_number": doc.metadata.get("page", None),
+                        "source_url": doc.metadata.get("source", None),
+                        "google_drive_url": doc.metadata.get("google_drive_url", None),
+                        "document_type": doc.metadata.get("file_type", "unknown"),
+                        "correlation_id": correlation_id
+                    }
+                    sources.append(source)
+                
+                format_span.set_attribute("sources.formatted_count", len(sources))
             
-            # Generate response using retrieved documents
+            # ENHANCED: Generate response with clear AI operation tracking
             response_text = await self._generate_basic_response(request.query, docs, correlation_id)
             
             # Create citations
             citations = self._create_citations(docs, request.citation_format)
             
+            span.set_attributes({
+                "business.basic_processing_successful": True,
+                "documents.processed_count": len(docs),
+                "sources.created_count": len(sources),
+                "citations.generated_count": len(citations)
+            })
+            
             self.logger.info_with_context(
-                "Basic processing completed successfully",
+                f"Basic document search completed - processed {len(docs)} documents",
                 extra_attributes={
                     "documents.count": len(docs),
                     "sources.count": len(sources),
                     "citations.count": len(citations),
+                    "processing.method": "basic_document_search",
                     "correlation.id": correlation_id,
+                    "business.operation": "basic_processing",
                     "operation": "basic_processing",
                     "status": "success"
                 }
@@ -690,7 +944,7 @@ class EnhancedQueryEngine:
                 response=response_text,
                 sources=sources,
                 confidence=0.8,
-                query_type="basic_retrieval",
+                query_type="basic_document_retrieval",
                 complexity="medium",
                 processing_time=0.0,  # Will be updated by caller
                 context_used=request.include_context,
@@ -700,28 +954,35 @@ class EnhancedQueryEngine:
                 metadata={
                     "sources_count": len(sources),
                     "enhanced_processing": False,
+                    "processing_method": "basic_document_search",
                     "correlation_id": correlation_id
                 },
                 timestamp=""  # Will be updated by caller
             )
     
     async def _generate_basic_response(self, query: str, docs: List[Document], correlation_id: str) -> str:
-        """Generate response using OpenAI GPT with correlation"""
-        with self.tracer.start_as_current_span("openai_completion_call") as span:
+        """Generate response using OpenAI GPT with enhanced business context tracking"""
+        with self.tracer.start_as_current_span("🤖 OpenAI_Generate_Answer_from_Documents") as span:  # ENHANCED: Clear AI operation
             span.set_attributes({
-                "external.service.name": "openai",
-                "external.service.type": "completion_api",
+                "external.service.name": "openai-completion-api",
+                "external.service.type": "ai_completion_service",
                 "ai.model.name": "gpt-4o-mini",
-                "ai.operation": "completion",
-                "correlation.id": correlation_id
+                "ai.operation": "document_synthesis",
+                "ai.input.documents_count": len(docs),
+                "ai.input.query_length": len(query),
+                "business.operation": "generate_user_answer",
+                "correlation.id": correlation_id,
+                "operation.description": "Using OpenAI to synthesize answer from retrieved documents"
             })
             
-            self.logger.debug_with_context(
-                "Generating response with OpenAI",
+            self.logger.info_with_context(
+                f"Generating AI answer from {len(docs)} documents using OpenAI GPT-4o-mini",
                 extra_attributes={
                     "ai.model": "gpt-4o-mini",
                     "documents.count": len(docs),
+                    "ai.operation": "document_synthesis",
                     "correlation.id": correlation_id,
+                    "business.operation": "ai_response_generation",
                     "operation": "response_generation"
                 }
             )
@@ -739,33 +1000,52 @@ Question: {query}
 
 Please provide a detailed answer based on the context provided. If the context doesn't contain enough information to fully answer the question, please indicate what information is missing."""
 
-                response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant that answers questions based on provided context."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=1000,
-                    temperature=0.1
-                )
+                with self.tracer.start_as_current_span("🔗 OpenAI_API_Call") as api_span:
+                    api_span.set_attributes({
+                        "external.service.name": "openai-api",
+                        "ai.model": "gpt-4o-mini",
+                        "ai.max_tokens": 1000,
+                        "ai.temperature": 0.1,
+                        "api.operation": "chat_completion"
+                    })
+                    
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "You are a helpful assistant that answers questions based on provided context."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        max_tokens=1000,
+                        temperature=0.1
+                    )
+                    
+                    api_span.set_attributes({
+                        "ai.tokens.used": response.usage.total_tokens if response.usage else 0,
+                        "ai.response.generated": True
+                    })
                 
-                # Track external API call
-                external_api_calls.add(1, {"service": "openai", "operation": "completion"})
+                # Track external API call with business context
+                backend_service_calls.add(1, {"service": "openai", "operation": "completion", "purpose": "user_answer_generation"})
                 
                 response_text = response.choices[0].message.content
                 
                 span.set_attributes({
-                    "response_length": len(response_text),
-                    "model_used": "gpt-4o-mini"
+                    "response.final_length": len(response_text),
+                    "response.final_word_count": len(response_text.split()),
+                    "ai.model_used": "gpt-4o-mini",
+                    "ai.generation_successful": True,
+                    "business.user_answer_generated": True
                 })
                 
                 self.logger.info_with_context(
-                    "OpenAI response generated successfully",
+                    f"AI response generated successfully ({len(response_text)} characters)",
                     extra_attributes={
                         "response.length": len(response_text),
                         "response.word_count": len(response_text.split()),
                         "ai.model": "gpt-4o-mini",
+                        "ai.tokens_used": response.usage.total_tokens if response.usage else 0,
                         "correlation.id": correlation_id,
+                        "business.operation": "ai_response_generation",
                         "operation": "response_generation",
                         "status": "success"
                     }
@@ -775,12 +1055,21 @@ Please provide a detailed answer based on the context provided. If the context d
                 
             except Exception as e:
                 span.record_exception(e)
+                span.set_attributes({
+                    "ai.generation_failed": True,
+                    "fallback.triggered": True,
+                    "business.impact": "degraded_answer_quality"
+                })
+                
                 self.logger.error_with_context(
-                    "Error generating response with OpenAI",
+                    "OpenAI response generation failed, using document excerpts as fallback",
                     extra_attributes={
                         "error.type": type(e).__name__,
                         "error.message": str(e),
+                        "fallback.method": "document_excerpts",
+                        "business.impact": "user_gets_raw_document_content",
                         "correlation.id": correlation_id,
+                        "business.operation": "ai_response_generation",
                         "operation": "response_generation",
                         "status": "failed"
                     },
@@ -791,9 +1080,10 @@ Please provide a detailed answer based on the context provided. If the context d
                 fallback_response = f"Based on the retrieved documents, here's what I found relevant to your query: {context[:500]}..."
                 
                 self.logger.warning_with_context(
-                    "Using fallback response due to OpenAI error",
+                    "Using fallback document excerpts due to AI service unavailability",
                     extra_attributes={
                         "fallback_response.length": len(fallback_response),
+                        "fallback.reason": "openai_api_failure",
                         "correlation.id": correlation_id,
                         "operation": "response_generation"
                     }
@@ -802,63 +1092,114 @@ Please provide a detailed answer based on the context provided. If the context d
                 return fallback_response
     
     def _create_citations(self, docs: List[Document], format_type: str) -> List[str]:
-        """Create citations for the sources"""
-        citations = []
-        for i, doc in enumerate(docs):
-            title = doc.metadata.get("title", f"Document {i+1}")
-            source = doc.metadata.get("source", "Unknown source")
-            citations.append(f"[{i+1}] {title} - {source}")
-        
-        self.logger.debug_with_context(
-            "Citations created",
-            extra_attributes={
-                "citations.count": len(citations),
+        """Create properly formatted citations with enhanced metadata"""
+        with self.tracer.start_as_current_span("📝 Format_Academic_Citations") as span:
+            span.set_attributes({
+                "service.component": "citation-formatter",
+                "business.operation": "create_academic_citations",
                 "citation.format": format_type,
-                "operation": "citation_creation"
-            }
-        )
-        
-        return citations
+                "citation.documents_count": len(docs),
+                "operation.description": "Creating academic citations in requested format"
+            })
+            
+            citations = []
+            for i, doc in enumerate(docs):
+                title = doc.metadata.get("title", f"Document {i+1}")
+                source = doc.metadata.get("source", "Unknown source")
+                page = doc.metadata.get("page", "")
+                page_info = f" (Page {page})" if page else ""
+                citations.append(f"[{i+1}] {title}{page_info} - {source}")
+            
+            span.set_attributes({
+                "citations.created_count": len(citations),
+                "citation.format_applied": format_type
+            })
+            
+            self.logger.debug_with_context(
+                f"Created {len(citations)} citations in {format_type} format",
+                extra_attributes={
+                    "citations.count": len(citations),
+                    "citation.format": format_type,
+                    "business.operation": "citation_creation",
+                    "operation": "citation_creation"
+                }
+            )
+            
+            return citations
 
 # Initialize enhanced query engine
 enhanced_query_engine = None
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the enhanced query engine with correlation"""
+    """Initialize the intelligent document system with comprehensive tracing"""
     global enhanced_query_engine
     
-    with tracer.start_as_current_span("api_service_startup") as span:
+    with tracer.start_as_current_span("🚀 API_Service_System_Startup") as span:  # ENHANCED: Clear startup operation
         span.set_attributes({
             "service.name": "document-rag-api",
-            "operation.name": "startup"
+            "service.version": "2.1.0",
+            "business.operation": "initialize_document_intelligence_system",
+            "startup.phase": "system_initialization",
+            "operation.description": "Starting up document RAG API with intelligent query processing"
         })
         
         logger.info_with_context(
-            "Starting Enhanced Document RAG API",
+            "🚀 Starting Document Intelligence API System",
             extra_attributes={
                 "service.name": "document-rag-api",
-                "service.version": "2.0.0",
+                "service.version": "2.1.0",
+                "business.system": "document_intelligence",
+                "business.operation": "service_startup",
                 "operation": "service_startup"
             }
         )
         
         try:
-            enhanced_query_engine = EnhancedQueryEngine()
+            with self.tracer.start_as_current_span("🧠 Initialize_Query_Engine") as engine_span:
+                engine_span.set_attributes({
+                    "service.component": "query-engine-initializer",
+                    "business.operation": "setup_intelligent_query_processing"
+                })
+                
+                enhanced_query_engine = EnhancedQueryEngine()
+                
+                engine_span.set_attributes({
+                    "query_engine.initialized": True,
+                    "system.ready_for_user_queries": True
+                })
+                
             logger.info_with_context(
-                "Enhanced query engine initialized successfully",
+                "✅ Document Intelligence API ready to serve user questions",
                 extra_attributes={
+                    "query_engine.status": "ready",
+                    "business.capability": "user_question_answering",
+                    "business.operation": "service_startup",
                     "operation": "service_startup",
                     "status": "success"
                 }
             )
+            
+            span.set_attributes({
+                "startup.successful": True,
+                "system.ready": True,
+                "business.service_ready": True
+            })
+            
         except Exception as e:
             span.record_exception(e)
+            span.set_attributes({
+                "startup.failed": True,
+                "business.service_unavailable": True,
+                "error.category": "startup_failure"
+            })
             logger.error_with_context(
-                "Failed to initialize enhanced query engine",
+                "💥 Failed to initialize Document Intelligence API",
                 extra_attributes={
                     "error.type": type(e).__name__,
                     "error.message": str(e),
+                    "business.impact": "users_cannot_ask_questions",
+                    "business.operation": "service_startup",
                     "operation": "service_startup",
                     "status": "failed"
                 },
@@ -866,24 +1207,30 @@ async def startup_event():
             )
             enhanced_query_engine = None
 
-# PRESERVED ORIGINAL ENDPOINTS - with added trace context extraction
+# ENHANCED ENDPOINTS: Clear business-focused naming
 
 @app.get("/", response_class=HTMLResponse)
-async def read_root():
-    """Serve the main HTML page with correlation - SAME AS ORIGINAL"""
-    with tracer.start_as_current_span("serve_root_page") as span:
+async def serve_document_interface():
+    """Serve the main document query interface with enhanced tracing"""
+    with tracer.start_as_current_span("🏠 Serve_User_Interface") as span:  # ENHANCED: Clear UI operation
         span.set_attributes({
             "service.name": "document-rag-api",
+            "service.component": "web-interface",
             "http.method": "GET",
             "http.route": "/",
-            "w3c.trace_id": get_current_trace_id()
+            "business.operation": "serve_user_interface",
+            "user.interface": "document_query_web_app",
+            "w3c.trace_id": get_current_trace_id(),
+            "operation.description": "Serving main web interface for document queries"
         })
         
-        logger.debug_with_context(
-            "Serving root page",
+        logger.info_with_context(
+            "Serving document query web interface to user",
             extra_attributes={
                 "http.method": "GET",
                 "http.route": "/",
+                "interface.type": "web_app",
+                "business.operation": "serve_user_interface",
                 "operation": "serve_page"
             }
         )
@@ -896,18 +1243,29 @@ async def read_root():
                 try:
                     with open(path, "r") as f:
                         html_content = f.read()
-                        # Inject trace information into HTML
+                        # Inject enhanced trace information into HTML
                         trace_id = get_current_trace_id()
                         html_content = html_content.replace(
                             "</head>", 
-                            f'<meta name="trace-id" content="{trace_id}"></head>'
+                            f'''<meta name="trace-id" content="{trace_id}">
+                            <meta name="service-name" content="document-rag-api">
+                            <meta name="business-system" content="document-intelligence">
+                            </head>'''
                         )
                         
-                        logger.debug_with_context(
-                            "Static HTML file served",
+                        span.set_attributes({
+                            "ui.file_served": path,
+                            "ui.trace_injected": True,
+                            "ui.enhanced_metadata": True
+                        })
+                        
+                        logger.info_with_context(
+                            f"Document interface served successfully from {path}",
                             extra_attributes={
                                 "file.path": path,
                                 "trace_id": trace_id,
+                                "ui.enhanced": True,
+                                "business.operation": "serve_user_interface",
                                 "operation": "serve_page"
                             }
                         )
@@ -916,36 +1274,51 @@ async def read_root():
                 except FileNotFoundError:
                     continue
             
-            # Fallback HTML with trace info
+            # ENHANCED: Fallback HTML with comprehensive business information
             trace_id = get_current_trace_id()
             fallback_html = f"""
             <!DOCTYPE html>
             <html>
             <head>
-                <title>Document RAG Query Interface</title>
+                <title>📚 Document Intelligence Query System</title>
                 <meta name="trace-id" content="{trace_id}">
+                <meta name="service-name" content="document-rag-api">
+                <meta name="business-system" content="document-intelligence">
                 <style>
-                    body {{ font-family: Arial, sans-serif; margin: 40px; }}
-                    .container {{ max-width: 800px; margin: 0 auto; }}
-                    .query-box {{ width: 100%; padding: 10px; margin: 20px 0; }}
-                    .submit-btn {{ padding: 10px 20px; background: #007bff; color: white; border: none; cursor: pointer; }}
-                    .result {{ margin-top: 20px; padding: 20px; background: #f8f9fa; border-radius: 5px; }}
+                    body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 40px; background: #f8f9fa; }}
+                    .container {{ max-width: 900px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+                    h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
+                    .system-info {{ background: #e8f4fd; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+                    .query-box {{ width: 100%; padding: 15px; margin: 20px 0; border: 2px solid #3498db; border-radius: 8px; font-size: 16px; }}
+                    .submit-btn {{ padding: 12px 24px; background: #3498db; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; }}
+                    .submit-btn:hover {{ background: #2980b9; }}
+                    .result {{ margin-top: 30px; padding: 20px; background: #f1f8ff; border-radius: 8px; border-left: 4px solid #3498db; }}
+                    .trace-info {{ font-family: 'Courier New', monospace; font-size: 12px; color: #666; }}
                 </style>
             </head>
             <body>
                 <div class="container">
-                    <h1>🔍 Document RAG Query Interface</h1>
-                    <p><strong>Service:</strong> document-rag-api</p>
-                    <p><strong>Trace ID:</strong> {trace_id}</p>
-                    <p><strong>W3C Propagation:</strong> Enabled</p>
+                    <h1>📚 Document Intelligence Query System</h1>
                     
-                    <textarea id="queryInput" class="query-box" placeholder="Enter your query here..." rows="3"></textarea>
+                    <div class="system-info">
+                        <h3>🔧 System Information</h3>
+                        <p><strong>Service:</strong> Document RAG API v2.1.0</p>
+                        <p><strong>Business System:</strong> Intelligent Document Retrieval & AI Response</p>
+                        <p><strong>Current Session Trace:</strong> <span class="trace-info">{trace_id}</span></p>
+                        <p><strong>W3C Trace Propagation:</strong> ✅ Enabled</p>
+                        <p><strong>Service Map Visibility:</strong> ✅ Enhanced</p>
+                        <p><strong>Capabilities:</strong> Vector Search, AI Synthesis, Citation Generation</p>
+                    </div>
+                    
+                    <h3>💬 Ask a Question About Your Documents</h3>
+                    <textarea id="queryInput" class="query-box" placeholder="Enter your question about the documents here..." rows="4"></textarea>
                     <br>
-                    <button class="submit-btn" onclick="submitQuery()">Submit Query</button>
+                    <button class="submit-btn" onclick="submitQuery()">🔍 Find Answer</button>
                     
                     <div id="result" class="result" style="display:none;">
-                        <h3>Response:</h3>
+                        <h3>📋 Response:</h3>
                         <div id="responseText"></div>
+                        <div id="traceInfo" class="trace-info" style="margin-top: 15px;"></div>
                     </div>
                 </div>
                 
@@ -954,30 +1327,70 @@ async def read_root():
                     const query = document.getElementById('queryInput').value;
                     if (!query.trim()) return;
                     
+                    const submitBtn = document.querySelector('.submit-btn');
+                    submitBtn.textContent = '🔄 Processing...';
+                    submitBtn.disabled = true;
+                    
                     try {{
                         const response = await fetch('/api/query', {{
                             method: 'POST',
-                            headers: {{ 'Content-Type': 'application/json' }},
-                            body: JSON.stringify({{ query: query }})
+                            headers: {{ 
+                                'Content-Type': 'application/json',
+                                'X-Business-Operation': 'user-document-query'
+                            }},
+                            body: JSON.stringify({{ 
+                                query: query,
+                                session_id: sessionStorage.getItem('session_id') || null
+                            }})
                         }});
                         
                         const result = await response.json();
-                        document.getElementById('responseText').innerHTML = result.response || result.answer || 'No response';
+                        
+                        if (result.session_id) {{
+                            sessionStorage.setItem('session_id', result.session_id);
+                        }}
+                        
+                        document.getElementById('responseText').innerHTML = 
+                            '<strong>Answer:</strong><br>' + (result.response || result.answer || 'No response') +
+                            '<br><br><strong>Sources:</strong> ' + (result.sources ? result.sources.length + ' documents found' : '0 documents') +
+                            '<br><strong>Processing Time:</strong> ' + (result.processing_time ? result.processing_time.toFixed(2) + 's' : 'N/A');
+                        
+                        document.getElementById('traceInfo').innerHTML = 
+                            'Trace ID: ' + (result.metadata?.trace_id || 'N/A') + 
+                            ' | Method: ' + (result.metadata?.processing_method || 'N/A');
+                        
                         document.getElementById('result').style.display = 'block';
+                        
                     }} catch (error) {{
                         document.getElementById('responseText').innerHTML = 'Error: ' + error.message;
                         document.getElementById('result').style.display = 'block';
+                    }} finally {{
+                        submitBtn.textContent = '🔍 Find Answer';
+                        submitBtn.disabled = false;
                     }}
+                }}
+                
+                // Generate session ID if not exists
+                if (!sessionStorage.getItem('session_id')) {{
+                    sessionStorage.setItem('session_id', 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9));
                 }}
                 </script>
             </body>
             </html>
             """
             
+            span.set_attributes({
+                "ui.fallback_served": True,
+                "ui.enhanced_metadata": True,
+                "business.user_interface_available": True
+            })
+            
             logger.info_with_context(
-                "Fallback HTML served",
+                "Served enhanced fallback interface with business context",
                 extra_attributes={
                     "trace_id": trace_id,
+                    "ui.type": "fallback_enhanced",
+                    "business.operation": "serve_user_interface",
                     "operation": "serve_page",
                     "mode": "fallback"
                 }
@@ -987,32 +1400,46 @@ async def read_root():
             
         except Exception as e:
             span.record_exception(e)
+            span.set_attributes({
+                "ui.serving_failed": True,
+                "business.impact": "users_cannot_access_interface"
+            })
             logger.error_with_context(
-                "Error loading UI",
+                "Failed to serve user interface",
                 extra_attributes={
                     "error.type": type(e).__name__,
                     "error.message": str(e),
+                    "business.impact": "user_interface_unavailable",
+                    "business.operation": "serve_user_interface",
                     "operation": "serve_page"
                 },
                 exc_info=True
             )
-            return HTMLResponse(content=f"<h1>Error loading UI: {str(e)}</h1>", status_code=500)
+            return HTMLResponse(content=f"<h1>System Error: Unable to load document interface: {str(e)}</h1>", status_code=500)
 
-# Replace your existing process_query function with this enhanced version
 @app.post("/api/query", response_model=QueryResponse)
-async def process_query(request: QueryRequest):
-    """Process query with enhanced error logging and code line capture"""
-    with tracer.start_as_current_span("api_query_endpoint") as span:
+async def answer_user_question(request: QueryRequest):
+    """Process user questions with enhanced business-focused tracing and error handling"""
+    with tracer.start_as_current_span("💬 Answer_User_Document_Question") as span:  # ENHANCED: Clear business operation
+        query_hash = hashlib.md5(request.query.encode()).hexdigest()[:8]
+        
         span.set_attributes({
             "service.name": "document-rag-api",
+            "service.component": "user-question-handler",
             "http.method": "POST",
             "http.route": "/api/query",
-            "user.query": request.query[:100],
-            "w3c.trace_id": get_current_trace_id()
+            "business.operation": "answer_user_question",
+            "user.question.preview": request.query[:100],
+            "user.question.hash": query_hash,
+            "user.session_type": "returning" if request.session_id else "new",
+            "user.wants_citations": request.citation_format != "none",
+            "user.max_sources": request.max_sources or 5,
+            "w3c.trace_id": get_current_trace_id(),
+            "operation.description": "Processing user question to retrieve documents and generate intelligent answer"
         })
         
         logger.info_with_context(
-            "API request received",
+            f"Received user question: '{request.query[:50]}{'...' if len(request.query) > 50 else ''}'",
             extra_attributes={
                 "http.method": "POST",
                 "http.route": "/api/query",
@@ -1020,95 +1447,127 @@ async def process_query(request: QueryRequest):
                 "request.session_id": request.session_id,
                 "request.citation_format": request.citation_format,
                 "request.max_sources": request.max_sources,
+                "user.session_type": "returning" if request.session_id else "new",
+                "business.operation": "user_question_received",
                 "operation": "api_request"
             }
         )
         
-        # PURPOSEFUL ERRORS for testing - with code line capture
+        # ENHANCED: Test error scenarios with clear business impact
         if "test error" in request.query.lower() or "debug error" in request.query.lower():
-            try:
-                # Simulate a real code error scenario
-                problematic_data = {"value": None}
-                result = problematic_data["value"].upper()  # This will throw AttributeError
+            with self.tracer.start_as_current_span("🧪 Simulate_System_Error_for_Testing") as test_span:
+                test_span.set_attributes({
+                    "test.error_simulation": True,
+                    "test.purpose": "monitoring_validation",
+                    "business.operation": "system_testing"
+                })
                 
-            except Exception as e:
-                enhanced_error_logging(
-                    logger,
-                    "Purposeful test error triggered for monitoring validation",
-                    extra_attributes={
-                        "http.method": "POST",
-                        "http.route": "/api/query",
-                        "http.status_code": 400,
+                try:
+                    # Simulate a real code error scenario
+                    problematic_data = {"value": None}
+                    result = problematic_data["value"].upper()  # This will throw AttributeError
+                    
+                except Exception as e:
+                    enhanced_error_logging(
+                        logger,
+                        "Test error simulation triggered for monitoring validation",
+                        extra_attributes={
+                            "http.method": "POST",
+                            "http.route": "/api/query",
+                            "http.status_code": 400,
+                            "error.type": "test_error_simulation",
+                            "error.category": "monitoring_test",
+                            "business.operation": "system_testing",
+                            "test.monitoring_validation": True,
+                            "trace.correlation_id": get_current_trace_id(),
+                            "session.id": request.session_id or "anonymous",
+                            "operation": "api_request",
+                            "status": "test_error_triggered"
+                        }
+                    )
+                    
+                    span.set_attributes({
+                        "error.purposeful": True,
                         "error.type": "test_error_simulation",
-                        "error.category": "test_simulation",
-                        "trace.correlation_id": get_current_trace_id(),
-                        "session.id": request.session_id or "anonymous",
-                        "operation": "api_request",
-                        "status": "test_error_triggered",
-                        "kibana.test_marker": True,
-                        "test.error_line_capture": True
-                    }
-                )
-                
-                span.set_attributes({
-                    "error.purposeful": True,
-                    "error.type": "test_error_simulation",
-                    "source.has_code_context": True
-                })
-                
-                span.record_exception(e)
-                raise HTTPException(status_code=400, detail={
-                    "error": "Test error simulation triggered",
-                    "message": str(e),
-                    "trace_id": get_current_trace_id(),
-                    "type": "test_error_simulation"
-                })
+                        "test.error_captured": True,
+                        "business.testing": True
+                    })
+                    
+                    span.record_exception(e)
+                    raise HTTPException(status_code=400, detail={
+                        "error": "Test error simulation triggered",
+                        "message": str(e),
+                        "trace_id": get_current_trace_id(),
+                        "type": "test_error_simulation",
+                        "business_operation": "monitoring_test"
+                    })
         
-        # DATABASE ERROR simulation
+        # ENHANCED: Database error simulation with business impact
         if "database error" in request.query.lower():
-            try:
-                connection_string = None  # Simulate missing config
-                db_client = connection_string.connect()  # This will throw AttributeError
-                
-            except Exception as e:
-                enhanced_error_logging(
-                    logger,
-                    "Simulated database connection error",
-                    extra_attributes={
-                        "error.type": "simulated_database_connection_error",
-                        "error.category": "database_simulation",
-                        "database.system": "qdrant",
-                        "trace.correlation_id": get_current_trace_id(),
-                        "kibana.test_marker": True,
-                        "test.error_line_capture": True
-                    }
-                )
-                span.record_exception(e)
-                raise HTTPException(status_code=503, detail={
-                    "error": "Database connection error simulation",
-                    "message": str(e),
-                    "trace_id": get_current_trace_id()
+            with self.tracer.start_as_current_span("🧪 Simulate_Database_Connection_Error") as db_test_span:
+                db_test_span.set_attributes({
+                    "test.database_error_simulation": True,
+                    "business.operation": "database_failure_testing",
+                    "business.impact": "user_queries_blocked"
                 })
+                
+                try:
+                    connection_string = None  # Simulate missing config
+                    db_client = connection_string.connect()  # This will throw AttributeError
+                    
+                except Exception as e:
+                    enhanced_error_logging(
+                        logger,
+                        "Simulated database connection error for monitoring validation",
+                        extra_attributes={
+                            "error.type": "simulated_database_connection_error",
+                            "error.category": "database_simulation",
+                            "database.system": "qdrant",
+                            "business.operation": "database_failure_testing",
+                            "business.impact": "document_search_unavailable",
+                            "trace.correlation_id": get_current_trace_id(),
+                            "test.database_monitoring": True
+                        }
+                    )
+                    span.record_exception(e)
+                    raise HTTPException(status_code=503, detail={
+                        "error": "Database connection error simulation",
+                        "message": str(e),
+                        "trace_id": get_current_trace_id(),
+                        "business_impact": "document_search_unavailable"
+                    })
         
         if not enhanced_query_engine:
             enhanced_error_logging(
                 logger,
-                "Query engine not initialized",
+                "Query engine not initialized - users cannot ask questions",
                 extra_attributes={
                     "http.status_code": 503,
-                    "operation": "api_request",
-                    "component": "query_engine"
+                    "business.impact": "all_user_queries_blocked",
+                    "business.operation": "user_question_processing",
+                    "component": "query_engine",
+                    "system.availability": "unavailable"
                 }
             )
-            raise HTTPException(status_code=503, detail="Enhanced query engine not initialized")
-        
-        # ... rest of your existing code for normal processing ...
+            raise HTTPException(status_code=503, detail="Document intelligence system not available")
         
         try:
             # Process query with enhanced engine
-            response = await enhanced_query_engine.process_query(request)
+            with self.tracer.start_as_current_span("⚡ Execute_Complete_Question_Processing") as processing_span:
+                processing_span.set_attributes({
+                    "business.operation": "complete_user_question_flow",
+                    "operation.description": "Full end-to-end processing: search documents → generate answer → format response"
+                })
+                
+                response = await enhanced_query_engine.process_query(request)
+                
+                processing_span.set_attributes({
+                    "business.question_answered": True,
+                    "user.satisfaction_likely": "high" if response.confidence > 0.7 else "medium"
+                })
             
-            # ... existing success logging ...
+            # Record successful API request
+            backend_service_calls.add(1, {"operation": "user_query", "success": True})
             
             return response
             
@@ -1116,60 +1575,76 @@ async def process_query(request: QueryRequest):
             # Use enhanced error logging for HTTP errors
             enhanced_error_logging(
                 logger,
-                "API request failed with HTTP error",
+                "User question processing failed with HTTP error",
                 extra_attributes={
                     "http.method": "POST",
                     "http.route": "/api/query",
                     "http.status_code": e.status_code,
                     "error.detail": str(e.detail),
+                    "business.impact": "user_question_failed",
+                    "business.operation": "user_question_processing",
                     "operation": "api_request",
                     "status": "http_error"
                 }
             )
+            user_experience_errors.add(1, {"operation": "query_processing", "error_type": "http_error"})
             raise
             
         except Exception as e:
             # Use enhanced error logging for unexpected errors
             enhanced_error_logging(
                 logger,
-                "API request failed with unexpected error",
+                "User question processing failed with unexpected error",
                 extra_attributes={
                     "http.method": "POST",
                     "http.route": "/api/query",
                     "http.status_code": 500,
+                    "business.impact": "user_question_failed",
+                    "business.operation": "user_question_processing",
                     "operation": "api_request",
                     "status": "unexpected_error"
                 }
             )
-            raise HTTPException(status_code=500, detail="Internal server error")
+            user_experience_errors.add(1, {"operation": "query_processing", "error_type": "unexpected"})
+            raise HTTPException(status_code=500, detail="Unable to process your question at this time")
 
 @app.get("/api/sessions/{session_id}")
-async def get_session(session_id: str):
-    """Get session information with correlation - SAME AS ORIGINAL"""
-    with tracer.start_as_current_span("get_session_info") as span:
+async def get_user_session_info(session_id: str):
+    """Get user conversation history and session details with enhanced business context"""
+    with tracer.start_as_current_span("👤 Retrieve_User_Conversation_History") as span:  # ENHANCED: Clear session operation
         span.set_attributes({
             "service.name": "document-rag-api",
-            "session_id": session_id
+            "service.component": "session-manager",
+            "business.operation": "retrieve_user_session",
+            "user.session_id": session_id,
+            "operation.description": "Retrieving user's conversation history and session metadata"
         })
         
-        logger.debug_with_context(
-            "Session information requested",
+        logger.info_with_context(
+            f"Retrieving conversation history for user session {session_id[:8]}",
             extra_attributes={
                 "session.id": session_id,
+                "business.operation": "user_session_retrieval",
                 "operation": "session_info"
             }
         )
         
         if session_id not in sessions:
+            span.set_attributes({
+                "session.found": False,
+                "business.impact": "user_history_unavailable"
+            })
             logger.warning_with_context(
-                "Session not found",
+                f"User session {session_id[:8]} not found in active sessions",
                 extra_attributes={
                     "session.id": session_id,
+                    "session.status": "not_found",
+                    "business.operation": "user_session_retrieval",
                     "operation": "session_info",
                     "status": "not_found"
                 }
             )
-            raise HTTPException(status_code=404, detail="Session not found")
+            raise HTTPException(status_code=404, detail="User session not found")
         
         conversation_context = conversation_contexts.get(session_id)
         conversation_history = []
@@ -1184,13 +1659,19 @@ async def get_session(session_id: str):
                 for msg in conversation_context.get_messages()
             ]
         
-        span.set_attribute("conversation_history_length", len(conversation_history))
+        span.set_attributes({
+            "session.found": True,
+            "conversation.message_count": len(conversation_history),
+            "session.has_conversation_history": len(conversation_history) > 0
+        })
         
-        logger.debug_with_context(
-            "Session information provided",
+        logger.info_with_context(
+            f"Retrieved session with {len(conversation_history)} messages",
             extra_attributes={
                 "session.id": session_id,
                 "conversation.message_count": len(conversation_history),
+                "session.active": True,
+                "business.operation": "user_session_retrieval",
                 "operation": "session_info",
                 "status": "success"
             }
@@ -1201,95 +1682,161 @@ async def get_session(session_id: str):
             "conversation_history": conversation_history,
             "trace_context": {
                 "trace_id": get_current_trace_id(),
-                "service": "document-rag-api"
+                "service": "document-rag-api",
+                "business_system": "document_intelligence"
             }
         }
 
 @app.get("/api/health")
-async def health_check():
-    """Health check endpoint with service correlation - ENHANCED FROM ORIGINAL"""
-    with tracer.start_as_current_span("health_check") as span:
+async def system_health_check():
+    """Comprehensive system health check with enhanced business context"""
+    with tracer.start_as_current_span("🏥 System_Health_Check") as span:  # ENHANCED: Clear health check operation
         span.set_attributes({
             "service.name": "document-rag-api",
+            "service.component": "health-monitor",
             "http.method": "GET",
-            "http.route": "/api/health"
+            "http.route": "/api/health",
+            "business.operation": "validate_system_health",
+            "health.check_type": "comprehensive",
+            "operation.description": "Checking all system components for user-facing service availability"
         })
         
-        logger.debug_with_context(
-            "Health check requested",
+        logger.info_with_context(
+            "Performing comprehensive system health check",
             extra_attributes={
+                "health.check_type": "comprehensive",
+                "business.operation": "system_health_validation",
                 "operation": "health_check"
             }
         )
         
-        status = "healthy" if enhanced_query_engine and enhanced_query_engine.vector_store else "unhealthy"
+        system_healthy = enhanced_query_engine and enhanced_query_engine.vector_store
+        status = "healthy" if system_healthy else "unhealthy"
         
-        components = {
-            "vector_store": enhanced_query_engine.vector_store is not None if enhanced_query_engine else False,
-            "hybrid_search": enhanced_query_engine.hybrid_search is not None if enhanced_query_engine else False,
-            "context_aware_engine": enhanced_query_engine.context_aware_engine is not None if enhanced_query_engine else False,
-            "response_generator": enhanced_query_engine.response_generator is not None if enhanced_query_engine else False,
-            "source_attributor": enhanced_query_engine.source_attributor is not None if enhanced_query_engine else False
-        }
+        # ENHANCED: Detailed component health assessment
+        components = {}
+        if enhanced_query_engine:
+            components = {
+                "vector_database": enhanced_query_engine.vector_store is not None,
+                "hybrid_search_engine": enhanced_query_engine.hybrid_search is not None,
+                "context_aware_ai": enhanced_query_engine.context_aware_engine is not None,
+                "ai_response_generator": enhanced_query_engine.response_generator is not None,
+                "citation_system": enhanced_query_engine.source_attributor is not None
+            }
+        else:
+            components = {
+                "vector_database": False,
+                "hybrid_search_engine": False,
+                "context_aware_ai": False,
+                "ai_response_generator": False,
+                "citation_system": False
+            }
         
         healthy_components = sum(1 for v in components.values() if v)
+        total_components = len(components)
+        health_percentage = (healthy_components / total_components) * 100 if total_components > 0 else 0
+        
+        # ENHANCED: Business impact assessment
+        business_capabilities = {
+            "can_answer_user_questions": components.get("vector_database", False),
+            "can_provide_intelligent_responses": components.get("context_aware_ai", False),
+            "can_format_citations": components.get("citation_system", False),
+            "can_maintain_conversation_context": components.get("context_aware_ai", False),
+            "can_perform_hybrid_search": components.get("hybrid_search_engine", False)
+        }
+        
+        operational_capabilities = sum(1 for v in business_capabilities.values() if v)
         
         span.set_attributes({
-            "health.status": status,
-            "components.healthy_count": healthy_components
+            "health.overall_status": status,
+            "health.percentage": health_percentage,
+            "components.healthy_count": healthy_components,
+            "components.total_count": total_components,
+            "business.operational_capabilities": operational_capabilities,
+            "business.core_functionality_available": components.get("vector_database", False),
+            "system.can_serve_users": system_healthy
         })
         
         logger.info_with_context(
-            "Health check completed",
+            f"System health check completed - {status} ({health_percentage:.1f}% components operational)",
             extra_attributes={
                 "health.status": status,
+                "health.percentage": health_percentage,
                 "components.healthy_count": healthy_components,
-                "components.total_count": len(components),
+                "components.total_count": total_components,
+                "business.can_serve_users": system_healthy,
+                "business.operational_capabilities": operational_capabilities,
+                "business.operation": "system_health_validation",
                 "operation": "health_check"
             }
         )
         
         return {
             "status": status,
+            "health_percentage": health_percentage,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "version": "2.0.0",
+            "version": "2.1.0",
             "service": "document-rag-api",
+            "business_system": "document_intelligence",
             "components": components,
+            "business_capabilities": business_capabilities,
+            "operational_summary": {
+                "can_serve_users": system_healthy,
+                "components_operational": f"{healthy_components}/{total_components}",
+                "core_functionality": "available" if components.get("vector_database", False) else "unavailable"
+            },
             "trace_context": {
                 "trace_id": get_current_trace_id(),
                 "w3c_propagation": "enabled",
-                "service_hierarchy": "document-rag-orchestrator -> document-rag-api"
+                "service_hierarchy": "document-rag-orchestrator -> document-rag-api",
+                "business_system": "document_intelligence"
             }
         }
 
-# Backend proxy endpoints - with trace propagation
+# ENHANCED: Backend proxy endpoints with clear business purpose
 @app.get("/api/backend/status")
-async def get_backend_status():
-    """Proxy backend status with W3C propagation"""
-    with tracer.start_as_current_span("proxy_backend_status") as span:
+async def check_document_processing_backend():
+    """Check document processing backend availability with enhanced business context"""
+    with tracer.start_as_current_span("🔗 Check_Document_Processing_Backend_Health") as span:  # ENHANCED: Clear backend check
         span.set_attributes({
+            "service.name": "document-rag-api",
+            "service.component": "backend-health-checker",
+            "business.operation": "validate_backend_availability",
             "endpoint": "/api/backend/status",
-            "proxy.target": "document-rag-backend"
+            "proxy.target_service": "document-rag-backend",
+            "proxy.purpose": "document_processing_health_check",
+            "operation.description": "Verifying that document processing backend is available for file scanning"
         })
         
-        logger.debug_with_context(
-            "Proxying backend status request",
+        logger.info_with_context(
+            "Checking document processing backend availability",
             extra_attributes={
                 "proxy.target": "document-rag-backend",
+                "business.operation": "backend_health_validation",
                 "operation": "backend_proxy"
             }
         )
         
         try:
-            async with TracedHTTPXClient(service_name="backend-proxy") as client:
+            async with TracedHTTPXClient(service_name="backend-health-proxy") as client:
                 response = await client.get("http://localhost:8001/status", timeout=10.0)
                 
-                if response.status_code == 200:
+                backend_healthy = response.status_code == 200
+                span.set_attributes({
+                    "backend.available": backend_healthy,
+                    "backend.http_status": response.status_code,
+                    "business.backend_operational": backend_healthy,
+                    "proxy.successful": True
+                })
+                
+                if backend_healthy:
                     result = response.json()
                     logger.info_with_context(
-                        "Backend status retrieved successfully",
+                        "Document processing backend is healthy and available",
                         extra_attributes={
                             "backend.status_code": response.status_code,
+                            "backend.available": True,
+                            "business.operation": "backend_health_validation",
                             "operation": "backend_proxy",
                             "status": "success"
                         }
@@ -1297,102 +1844,420 @@ async def get_backend_status():
                     return result
                 else:
                     logger.error_with_context(
-                        "Backend returned non-200 status",
+                        f"Document processing backend returned unhealthy status: {response.status_code}",
                         extra_attributes={
                             "backend.status_code": response.status_code,
+                            "backend.available": False,
+                            "business.impact": "document_processing_degraded",
+                            "business.operation": "backend_health_validation",
                             "operation": "backend_proxy",
                             "status": "error"
                         }
                     )
-                    raise HTTPException(status_code=502, detail=f"Backend returned {response.status_code}")
+                    raise HTTPException(status_code=502, detail=f"Document processing backend unhealthy: {response.status_code}")
                     
         except Exception as e:
             span.record_exception(e)
+            span.set_attributes({
+                "backend.available": False,
+                "proxy.failed": True,
+                "business.impact": "backend_unavailable"
+            })
             logger.error_with_context(
-                "Backend service error",
+                "Cannot reach document processing backend",
                 extra_attributes={
                     "error.type": type(e).__name__,
                     "error.message": str(e),
+                    "business.impact": "document_processing_unavailable",
+                    "business.operation": "backend_health_validation",
                     "operation": "backend_proxy",
                     "status": "failed"
                 },
                 exc_info=True
             )
-            raise HTTPException(status_code=502, detail=f"Backend service error: {str(e)}")
+            raise HTTPException(status_code=502, detail=f"Document processing backend unavailable: {str(e)}")
 
 @app.post("/api/backend/scan")
-async def trigger_backend_scan():
-    """Trigger backend scan with W3C propagation"""
-    with tracer.start_as_current_span("trigger_backend_scan") as span:
+async def trigger_document_scan():
+    """Trigger document processing scan with enhanced business context"""
+    with tracer.start_as_current_span("📁 Trigger_Document_Processing_Scan") as span:  # ENHANCED: Clear scan operation
+        span.set_attributes({
+            "service.name": "document-rag-api",
+            "service.component": "document-scan-trigger",
+            "business.operation": "trigger_document_processing",
+            "proxy.target_service": "document-rag-backend",
+            "proxy.purpose": "initiate_document_scanning",
+            "operation.description": "Triggering backend to scan for new documents and process them"
+        })
+        
         logger.info_with_context(
-            "Triggering backend scan",
+            "Triggering document processing scan on backend service",
             extra_attributes={
                 "proxy.target": "document-rag-backend",
+                "business.operation": "document_scan_trigger",
+                "scan.purpose": "process_new_documents",
                 "operation": "backend_scan_trigger"
             }
         )
         
         try:
-            async with TracedHTTPXClient(service_name="backend-proxy") as client:
-                response = await client.post("http://localhost:8001/scan", timeout=30.0)
+            async with TracedHTTPXClient(service_name="document-scan-proxy") as client:
+                with self.tracer.start_as_current_span("📡 Send_Scan_Request_to_Backend") as request_span:
+                    request_span.set_attributes({
+                        "external.service.name": "document-rag-backend",
+                        "business.operation": "request_document_scan",
+                        "proxy.timeout_seconds": 30
+                    })
+                    
+                    response = await client.post("http://localhost:8001/scan", timeout=30.0)
+                    
+                    request_span.set_attributes({
+                        "backend.scan_triggered": response.status_code == 200,
+                        "backend.response_code": response.status_code
+                    })
                 
-                if response.status_code == 200:
+                scan_successful = response.status_code == 200
+                span.set_attributes({
+                    "scan.triggered": scan_successful,
+                    "backend.status_code": response.status_code,
+                    "business.document_scan_initiated": scan_successful
+                })
+                
+                if scan_successful:
                     result = response.json()
                     logger.info_with_context(
-                        "Backend scan triggered successfully",
+                        "Document processing scan triggered successfully",
                         extra_attributes={
                             "backend.status_code": response.status_code,
+                            "scan.triggered": True,
+                            "business.operation": "document_scan_trigger",
                             "operation": "backend_scan_trigger",
                             "status": "success"
                         }
                     )
+                    backend_service_calls.add(1, {"operation": "scan_trigger", "success": True})
                     return result
                 else:
                     logger.error_with_context(
-                        "Backend scan trigger failed",
+                        f"Document scan trigger failed with status {response.status_code}",
                         extra_attributes={
                             "backend.status_code": response.status_code,
+                            "scan.triggered": False,
+                            "business.impact": "documents_not_processed",
+                            "business.operation": "document_scan_trigger",
                             "operation": "backend_scan_trigger",
                             "status": "failed"
                         }
                     )
-                    raise HTTPException(status_code=502, detail=f"Scan failed: {response.status_code}")
+                    user_experience_errors.add(1, {"operation": "scan_trigger", "error_type": "backend_error"})
+                    raise HTTPException(status_code=502, detail=f"Document scan failed: {response.status_code}")
                     
         except Exception as e:
             span.record_exception(e)
+            span.set_attributes({
+                "scan.triggered": False,
+                "proxy.failed": True,
+                "business.impact": "document_scan_unavailable"
+            })
             logger.error_with_context(
-                "Backend scan trigger error",
+                "Failed to trigger document processing scan",
                 extra_attributes={
                     "error.type": type(e).__name__,
                     "error.message": str(e),
+                    "business.impact": "document_processing_unavailable",
+                    "business.operation": "document_scan_trigger",
                     "operation": "backend_scan_trigger",
                     "status": "failed"
                 },
                 exc_info=True
             )
-            raise HTTPException(status_code=502, detail=f"Scan failed: {str(e)}")
+            user_experience_errors.add(1, {"operation": "scan_trigger", "error_type": "connection_error"})
+            raise HTTPException(status_code=502, detail=f"Cannot trigger document scan: {str(e)}")
+
+# ENHANCED: Service map visibility endpoint
+@app.get("/api/service-map")
+async def get_service_map_info():
+    """Get service map and architecture information for monitoring dashboards"""
+    with tracer.start_as_current_span("🗺️ Generate_Service_Map_Information") as span:
+        span.set_attributes({
+            "service.name": "document-rag-api",
+            "business.operation": "provide_service_architecture_info",
+            "operation.description": "Generating service map data for monitoring and observability"
+        })
+        
+        logger.info_with_context(
+            "Generating service map information",
+            extra_attributes={
+                "business.operation": "service_map_generation",
+                "operation": "service_map_info"
+            }
+        )
+        
+        service_map = {
+            "current_service": {
+                "name": "document-rag-api",
+                "display_name": "📚 Document Intelligence API",
+                "type": "api_service",
+                "business_purpose": "Process user questions and generate intelligent answers from documents",
+                "version": "2.1.0",
+                "components": [
+                    {
+                        "name": "intelligent-query-processor",
+                        "display_name": "🧠 Intelligent Query Processor",
+                        "purpose": "Process user questions with context awareness"
+                    },
+                    {
+                        "name": "session-manager", 
+                        "display_name": "👤 User Session Manager",
+                        "purpose": "Manage user conversations and context"
+                    },
+                    {
+                        "name": "ai-response-generator",
+                        "display_name": "✍️ AI Response Generator", 
+                        "purpose": "Generate intelligent answers from documents"
+                    },
+                    {
+                        "name": "backend-health-checker",
+                        "display_name": "🔗 Backend Health Monitor",
+                        "purpose": "Monitor document processing backend availability"
+                    }
+                ]
+            },
+            "external_dependencies": [
+                {
+                    "service": "document-rag-backend",
+                    "display_name": "📄 Document Processing Backend",
+                    "type": "processing_service", 
+                    "purpose": "Scan, process and index documents",
+                    "endpoint": "http://localhost:8001"
+                },
+                {
+                    "service": "qdrant-vector-database",
+                    "display_name": "🔍 Vector Database (Qdrant)",
+                    "type": "database",
+                    "purpose": "Store and search document embeddings",
+                    "endpoint": f"http://{enhanced_query_engine.qdrant_host if enhanced_query_engine else 'localhost'}:6333"
+                },
+                {
+                    "service": "openai-completion-api",
+                    "display_name": "🤖 OpenAI Completion API", 
+                    "type": "external_ai_service",
+                    "purpose": "Generate intelligent responses from document context",
+                    "endpoint": "https://api.openai.com"
+                }
+            ],
+            "business_flows": [
+                {
+                    "name": "user_question_flow",
+                    "display_name": "👤➡️📚➡️🤖➡️💬 User Question Processing",
+                    "steps": [
+                        "User submits question",
+                        "Search vector database for relevant documents", 
+                        "Generate AI response from documents",
+                        "Return formatted answer with citations"
+                    ]
+                },
+                {
+                    "name": "document_processing_flow",
+                    "display_name": "📁➡️📄➡️🔍➡️💾 Document Processing",
+                    "steps": [
+                        "Scan for new documents",
+                        "Extract text and metadata", 
+                        "Generate embeddings",
+                        "Store in vector database"
+                    ]
+                }
+            ],
+            "trace_context": {
+                "current_trace_id": get_current_trace_id(),
+                "service_hierarchy": "document-rag-orchestrator -> document-rag-api",
+                "w3c_propagation": "enabled"
+            }
+        }
+        
+        span.set_attributes({
+            "service_map.generated": True,
+            "service_map.components_count": len(service_map["current_service"]["components"]),
+            "service_map.dependencies_count": len(service_map["external_dependencies"]),
+            "service_map.business_flows_count": len(service_map["business_flows"])
+        })
+        
+        return service_map
+
+# ENHANCED: WebSocket endpoint with business context
+@app.websocket("/api/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket for real-time query processing with enhanced tracing"""
+    with tracer.start_as_current_span("🔌 WebSocket_Real_Time_Query_Connection") as span:
+        span.set_attributes({
+            "service.name": "document-rag-api",
+            "service.component": "realtime-query-handler",
+            "connection.type": "websocket",
+            "business.operation": "establish_realtime_user_connection",
+            "operation.description": "Establishing real-time connection for interactive document queries"
+        })
+        
+        await websocket.accept()
+        connection_id = str(uuid.uuid4())[:8]
+        
+        span.set_attributes({
+            "websocket.connection_id": connection_id,
+            "websocket.connected": True
+        })
+        
+        logger.info_with_context(
+            f"WebSocket connection established for real-time queries ({connection_id})",
+            extra_attributes={
+                "websocket.connection_id": connection_id,
+                "business.operation": "realtime_connection_established",
+                "operation": "websocket_connection"
+            }
+        )
+        
+        try:
+            while True:
+                # Wait for message from client
+                data = await websocket.receive_text()
+                message_data = json.loads(data)
+                
+                with tracer.start_as_current_span("💬 Process_Realtime_User_Query") as query_span:
+                    query_span.set_attributes({
+                        "service.component": "realtime-query-processor",
+                        "business.operation": "process_realtime_question",
+                        "websocket.connection_id": connection_id,
+                        "query.type": "realtime",
+                        "operation.description": "Processing user question via WebSocket real-time connection"
+                    })
+                    
+                    if enhanced_query_engine and message_data.get("query"):
+                        query_request = QueryRequest(
+                            query=message_data["query"],
+                            session_id=message_data.get("session_id"),
+                            citation_format=message_data.get("citation_format", "apa"),
+                            max_sources=message_data.get("max_sources", 5)
+                        )
+                        
+                        result = await enhanced_query_engine.process_query(query_request)
+                        
+                        response_data = {
+                            "type": "query_response",
+                            "data": result.dict(),
+                            "trace_id": get_current_trace_id(),
+                            "connection_id": connection_id
+                        }
+                        
+                        await websocket.send_text(json.dumps(response_data))
+                        
+                        query_span.set_attributes({
+                            "realtime.query_processed": True,
+                            "response.sent": True
+                        })
+                        
+                        logger.info_with_context(
+                            f"Real-time query processed and response sent ({connection_id})",
+                            extra_attributes={
+                                "websocket.connection_id": connection_id,
+                                "query.processed": True,
+                                "business.operation": "realtime_query_processing",
+                                "operation": "websocket_query"
+                            }
+                        )
+                    else:
+                        error_response = {
+                            "type": "error",
+                            "message": "Query engine not available or invalid query",
+                            "trace_id": get_current_trace_id()
+                        }
+                        await websocket.send_text(json.dumps(error_response))
+                        
+                        query_span.set_attributes({
+                            "realtime.query_failed": True,
+                            "error.reason": "invalid_request_or_service_unavailable"
+                        })
+        
+        except WebSocketDisconnect:
+            span.set_attributes({
+                "websocket.disconnected": True,
+                "disconnect.type": "client_initiated"
+            })
+            logger.info_with_context(
+                f"WebSocket client disconnected ({connection_id})",
+                extra_attributes={
+                    "websocket.connection_id": connection_id,
+                    "disconnect.type": "client_initiated",
+                    "business.operation": "realtime_connection_closed",
+                    "operation": "websocket_disconnect"
+                }
+            )
+        except Exception as e:
+            span.record_exception(e)
+            span.set_attributes({
+                "websocket.error": True,
+                "business.impact": "realtime_connection_lost"
+            })
+            logger.error_with_context(
+                f"WebSocket error for connection {connection_id}",
+                extra_attributes={
+                    "websocket.connection_id": connection_id,
+                    "error.type": type(e).__name__,
+                    "error.message": str(e),
+                    "business.operation": "realtime_query_processing",
+                    "operation": "websocket_error"
+                },
+                exc_info=True
+            )
 
 if __name__ == "__main__":
     import uvicorn
     
-    print("🔥 ENHANCED API SERVICE: Complete W3C Trace Propagation")
-    print("=" * 70)
-    print("📊 Service Hierarchy: document-rag-orchestrator → document-rag-api")
-    print("🧩 Components: query-processor, response-generator, session-manager, backend-proxy")
-    print("🔗 W3C Propagation: ENABLED")
-    print("🗺️ Middleware-Based Context: ACTIVE")
+    print("=" * 80)
+    print("🚀 ENHANCED DOCUMENT INTELLIGENCE API SERVICE")
+    print("=" * 80)
+    print("📊 Service Architecture:")
+    print("   └── document-rag-orchestrator (Parent)")
+    print("       └── document-rag-api (This Service)")
+    print("           ├── 🧠 intelligent-query-processor")
+    print("           ├── 👤 session-manager") 
+    print("           ├── ✍️ ai-response-generator")
+    print("           └── 🔗 backend-health-checker")
+    print()
+    print("🔗 External Dependencies:")
+    print("   ├── 📄 document-rag-backend (Document Processing)")
+    print("   ├── 🔍 qdrant-vector-database (Document Storage)")
+    print("   └── 🤖 openai-completion-api (AI Response Generation)")
+    print()
+    print("🎯 Business Capabilities:")
+    print("   ✅ Answer user questions about documents")
+    print("   ✅ Maintain conversation context")
+    print("   ✅ Generate academic citations") 
+    print("   ✅ Real-time query processing")
+    print("   ✅ Comprehensive health monitoring")
+    print()
+    print("🔍 Enhanced Observability:")
+    print("   ✅ W3C Trace Propagation")
+    print("   ✅ Business-focused span names")
+    print("   ✅ Service map visibility")
+    print("   ✅ Correlated logging")
+    print("   ✅ Performance metrics")
+    print()
     print(f"🆔 Root Trace ID: {get_current_trace_id()}")
-    print("🚀 Starting on http://0.0.0.0:8000")
-    print("=" * 70)
+    print("🌐 Starting on http://0.0.0.0:8000")
+    print("📈 Service map will show: User Questions → Document Search → AI Response")
+    print("=" * 80)
     
-    # Log service startup
+    # Log service startup with enhanced context
     startup_logger = get_correlated_logger("startup")
     startup_logger.info_with_context(
-        "API service starting up",
+        "Document Intelligence API service starting up with enhanced observability",
         extra_attributes={
             "host": "0.0.0.0",
             "port": 8000,
             "service.name": "document-rag-api",
+            "service.version": "2.1.0",
+            "business.system": "document_intelligence",
+            "observability.enhanced": True,
+            "service_map.visibility": "enhanced",
+            "business.operation": "service_startup",
             "operation": "service_startup"
         }
     )

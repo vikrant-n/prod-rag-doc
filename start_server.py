@@ -15,6 +15,10 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
+from opentelemetry import trace, context
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+
 # Suppress SSL warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -33,6 +37,89 @@ from otel_config import (
 
 # Initialize OpenTelemetry
 tracer, meter = initialize_opentelemetry("document-rag-api", "2.0.0", "production")
+
+def extract_parent_context_from_environment():
+    """Extract parent trace context from environment variables set by orchestrator"""
+    
+    # CRITICAL FIX: Import propagate inside function to avoid import issues
+    from opentelemetry import propagate
+    from opentelemetry.context import attach
+    
+    # Check for W3C trace context in environment
+    traceparent = os.getenv("OTEL_TRACE_PARENT")
+    tracestate = os.getenv("OTEL_TRACE_STATE", "")
+    
+    print(f"🔍 Looking for parent context in environment:")
+    print(f"   OTEL_TRACE_PARENT: {traceparent}")
+    print(f"   OTEL_TRACE_STATE: {tracestate}")
+    
+    if traceparent:
+        # Create headers dict for W3C propagator
+        headers = {
+            "traceparent": traceparent,
+            "tracestate": tracestate
+        }
+        
+        print(f"📥 Extracting W3C context from headers: {headers}")
+        
+        try:
+            # Extract context using OpenTelemetry propagator
+            parent_context = propagate.extract(headers)
+            
+            # Activate the extracted context
+            context_token = attach(parent_context)
+            
+            print(f"✅ Parent context extracted and activated")
+            print(f"   Context: {parent_context}")
+            
+            return context_token, parent_context
+        except Exception as e:
+            print(f"❌ Error extracting parent context: {e}")
+            return None, None
+    else:
+        print(f"ℹ️ No parent context found in environment")
+        return None, None
+
+def initialize_service_with_parent_context(service_name: str):
+    """Initialize service with proper parent context extraction"""
+    
+    print(f"🚀 Initializing {service_name} with parent context extraction")
+    
+    # Step 1: Extract parent context BEFORE initializing OpenTelemetry
+    context_token, parent_context = extract_parent_context_from_environment()
+    
+    # Step 2: Initialize OpenTelemetry in the context of parent
+    from otel_config import initialize_opentelemetry
+    tracer, meter = initialize_opentelemetry(
+        service_name=service_name,
+        service_version="2.0.0",
+        environment=os.getenv("OTEL_ENVIRONMENT", "production")
+    )
+    
+    # Step 3: Create startup span within parent context
+    with tracer.start_as_current_span(f"{service_name}_startup_with_parent") as span:
+        span.set_attributes({
+            "service.name": service_name,
+            "service.version": "2.0.0",
+            "service.parent": "document-rag-orchestrator",
+            "startup.with_parent_context": parent_context is not None,
+            "operation.name": "service_startup_with_context"
+        })
+        
+        # Log the trace information
+        span_context = span.get_span_context()
+        trace_id = format(span_context.trace_id, '032x')
+        span_id = format(span_context.span_id, '016x')
+        
+        print(f"🆔 Service {service_name} trace context:")
+        print(f"   Trace ID: {trace_id}")
+        print(f"   Span ID: {span_id}")
+        print(f"   Parent Context: {'✅ Yes' if parent_context else '❌ No'}")
+        print(f"   Context Token: {context_token}")
+        
+        # Store context token for cleanup later if needed
+        return tracer, meter, span, context_token
+
 
 class APIServiceLauncher:
     """API service launcher with middleware-based tracing and Elasticsearch support"""
@@ -343,8 +430,10 @@ def main():
     
     # Create span in orchestrator context if available
     orchestrator_tracer = get_service_tracer(parent_service)
+
+    tracer, meter, startup_span, context_token = initialize_service_with_parent_context("document-rag-api")
     
-    with orchestrator_tracer.start_as_current_span("api_service_main") as main_span:
+    with tracer.start_as_current_span("api_service_main") as main_span:
         main_span.set_attributes({
             "startup.mode": "launcher",
             "startup.parent_trace_id": parent_trace_id or "none",
@@ -375,6 +464,9 @@ def main():
             sys.exit(1)
 
 if __name__ == "__main__":
+    # Initialize with parent context
+    tracer, meter, startup_span, context_token = initialize_service_with_parent_context("document-rag-api")
+
     print("ENHANCED API SERVICE LAUNCHER")
     print("W3C Trace Context Propagation: ENABLED")
     print("Service Hierarchy: orchestrator → api → components")

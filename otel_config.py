@@ -75,7 +75,9 @@ SERVICE_HIERARCHY = {
     "document-rag-orchestrator": {
         "parent": None,
         "children": ["document-rag-api", "document-rag-backend", "process-manager"],
-        "type": "orchestrator"
+        "type": "orchestrator",
+        "service.namespace": "document-rag-system",
+        "service.instance.id": "orchestrator-1"
     },
     "process-manager": {
         "parent": "document-rag-orchestrator",
@@ -89,7 +91,9 @@ SERVICE_HIERARCHY = {
             "text-splitter", "embedding-generator", "vector-store-manager", 
             "file-fingerprint-db"
         ],
-        "type": "processing_service"
+        "type": "processing_service",
+        "service.namespace": "document-rag-system",
+        "service.instance.id": "backend-1"
     },
     "document-processor": {
         "parent": "document-rag-backend",
@@ -99,7 +103,9 @@ SERVICE_HIERARCHY = {
     "document-rag-api": {
         "parent": "document-rag-orchestrator",
         "children": ["query-processor", "session-manager", "response-generator", "backend-proxy"],
-        "type": "api_service"
+        "type": "api_service",
+        "service.namespace": "document-rag-system",
+        "service.instance.id": "api-1"
     },
     # Component-level services
     "google-drive-monitor": {"parent": "document-rag-backend", "type": "component"},
@@ -228,8 +234,8 @@ def create_enhanced_resource(service_name: str, service_version: str, environmen
         SERVICE_NAME: service_name,
         SERVICE_VERSION: service_version,
         "deployment.environment": environment,
-        "service.namespace": SERVICE_CONFIG["service_namespace"],
-        "service.instance.id": f"{service_name}-{os.getenv('HOSTNAME', os.getpid())}",
+        "service.namespace": hierarchy_info.get("service.namespace", SERVICE_CONFIG["service_namespace"]),
+        "service.instance.id": hierarchy_info.get("service.instance.id", f"{service_name}-{os.getenv('HOSTNAME', os.getpid())}"),
         "service.type": service_type,
         
         # Enhanced resource attributes for better service mapping
@@ -325,29 +331,62 @@ def _setup_correlated_logging(log_provider: LoggerProvider):
     root_logger.propagate = False
 
 def _setup_enhanced_auto_instrumentation():
-    """Setup enhanced automatic instrumentation for common libraries - MODIFIED"""
+    """Setup enhanced automatic instrumentation for common libraries - FIXED"""
     try:
         # Enhanced logging instrumentation
         LoggingInstrumentor().instrument(
             set_logging_format=True,
             log_correlation=True
         )
-    except Exception:
-        pass
+        print("✅ Logging instrumentation enabled")
+    except Exception as e:
+        print(f"⚠️  Logging instrumentation warning: {e}")
     
     try:
         # Enhanced HTTP client instrumentation
         RequestsInstrumentor().instrument(
             excluded_urls="healthcheck,metrics"  # Exclude noise
         )
-    except Exception:
-        pass
+        print("✅ Requests instrumentation enabled")
+    except Exception as e:
+        print(f"⚠️  Requests instrumentation warning: {e}")
     
     try:
         # Enhanced HTTPX instrumentation
         HTTPXClientInstrumentor().instrument()
-    except Exception:
-        pass
+        print("✅ HTTPX instrumentation enabled")
+    except Exception as e:
+        print(f"⚠️  HTTPX instrumentation warning: {e}")
+    
+    try:
+        # CRITICAL FIX: Add Elasticsearch instrumentation
+        from opentelemetry.instrumentation.elasticsearch import ElasticsearchInstrumentor
+        ElasticsearchInstrumentor().instrument()
+        print("✅ Elasticsearch instrumentation enabled")
+    except ImportError:
+        print("⚠️  Elasticsearch instrumentation not available - install opentelemetry-instrumentation-elasticsearch")
+    except Exception as e:
+        print(f"⚠️  Elasticsearch instrumentation warning: {e}")
+    
+    try:
+        # CRITICAL FIX: Add urllib3 instrumentation for better HTTP tracking
+        from opentelemetry.instrumentation.urllib3 import URLLib3Instrumentor
+        URLLib3Instrumentor().instrument()
+        print("✅ urllib3 instrumentation enabled")
+    except ImportError:
+        print("⚠️  urllib3 instrumentation not available - install opentelemetry-instrumentation-urllib3")
+    except Exception as e:
+        print(f"⚠️  urllib3 instrumentation warning: {e}")
+    
+    try:
+        # CRITICAL FIX: Add SQLite instrumentation for database tracking
+        from opentelemetry.instrumentation.sqlite3 import SQLite3Instrumentor
+        SQLite3Instrumentor().instrument()
+        print("✅ SQLite3 instrumentation enabled")
+    except ImportError:
+        print("⚠️  SQLite3 instrumentation not available - install opentelemetry-instrumentation-sqlite3")
+    except Exception as e:
+        print(f"⚠️  SQLite3 instrumentation warning: {e}")
 
 def _initialize_global_providers(resource: Resource):
     """Initialize global trace, metric, AND log providers with enhanced configuration"""
